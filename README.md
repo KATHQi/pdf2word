@@ -1,6 +1,6 @@
 # PDF2Word / OCR Extraction Service
 
-基于 PaddleOCR / ppstructure 的 PDF 转 Word 以及特定关键信息提取服务。
+基于 PaddleOCR / ppstructure 的 PDF 转 Word 以及特定关键信息提取服务。  
 
 ## 特性
 
