@@ -1,0 +1,10 @@
+/.idea/
+/.history/
+__pycache__/
+*.pyc
+/inference/
+*.docx
+*.xlsx
+/ppstructure/pdf2word/web_output/
+/ppstructure/pdf2word/web_uploads/
+/ppstructure/pdf2word/tmp/

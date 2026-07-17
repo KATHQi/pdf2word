@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF转Word - OCR版</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; }
+
+        /* 新增：整体左右布局 */
+        .app-shell { width: 100%; max-width: 900px; display: flex; align-items: flex-start; justify-content: center; gap: 20px; }
+        .sidebar { width: 210px; background: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); padding: 18px; margin-top: 20px; flex-shrink: 0; }
+        .sidebar-title { font-size: 15px; font-weight: 600; color: #1a1a1a; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #eee; }
+        .nav-item { width: 100%; border: none; background: transparent; color: #444; cursor: pointer; text-align: left; font-size: 14px; padding: 10px 12px; border-radius: 6px; margin-bottom: 8px; }
+        .nav-item:hover { background: #f5f7fb; }
+        .nav-item.active { background: #e8f0fe; color: #1a73e8; font-weight: 600; }
+        .right-area { flex: 1; min-width: 0; display: flex; justify-content: center; }
+        .panel { width: 100%; display: flex; justify-content: center; }
+
+        .card { background: white; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 100%; max-width: 600px; padding: 30px; margin-top: 20px; }
+        h2 { text-align: center; color: #1a1a1a; margin-bottom: 25px; }
+
+        /* 拖拽区 */
+        .drop-zone { border: 2px dashed #4285f4; border-radius: 12px; height: 130px; display: flex; flex-direction: column; justify-content: center; align-items: center; cursor: pointer; transition: background 0.2s; color: #4285f4; }
+        .drop-zone.drag-over { background: #e8f0fe; }
+        .drop-zone p { margin: 6px 0 0; font-size: 14px; }
+        .drop-zone small { color: #999; font-size: 12px; margin-top: 4px; }
+
+        /* 文件列表 */
+        #fileList { margin: 16px 0 0; max-height: 320px; overflow-y: auto; border: 1px solid #eee; border-radius: 8px; display: none; }
+        .file-item { display: flex; align-items: flex-start; padding: 10px 14px; border-bottom: 1px solid #f5f5f5; gap: 10px; flex-wrap: wrap; }
+        .file-item:last-child { border-bottom: none; }
+        .file-name { flex: 1; font-size: 13px; color: #333; word-break: break-all; min-width: 0; padding-top: 2px; }
+        .badge { flex-shrink: 0; font-size: 11px; padding: 2px 8px; border-radius: 10px; white-space: nowrap; align-self: center; }
+        .badge-waiting  { background: #f5f5f5; color: #888; }
+        .badge-running  { background: #e8f0fe; color: #4285f4; }
+        .badge-done     { background: #e6f4ea; color: #1e8e3e; }
+        .badge-error    { background: #fce8e6; color: #c5221f; }
+        .remove-btn { flex-shrink: 0; background: none; border: none; color: #bbb; cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px; align-self: center; }
+        .remove-btn:hover { color: #e53935; }
+        .file-result { width: 100%; margin-top: 4px; font-size: 12px; }
+        .download-link { color: #1e8e3e; text-decoration: none; font-weight: 500; }
+        .download-link:hover { text-decoration: underline; }
+        .error-text { color: #c5221f; }
+        .spinner-sm { display: inline-block; width: 11px; height: 11px; border: 2px solid rgba(66,133,244,.3); border-top-color: #4285f4; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 4px; }
+
+        /* 选项 */
+        .options { margin: 16px 0; font-size: 14px; color: #444; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+
+        /* 按钮 */
+        .btn-convert { display: block; width: 100%; background: #4285f4; color: white; border: none; padding: 12px; border-radius: 6px; font-size: 15px; cursor: pointer; }
+        .btn-convert:disabled { background: #ccc; cursor: not-allowed; }
+
+        /* 总进度状态 */
+        #status { margin-top: 14px; font-size: 14px; color: #555; text-align: center; min-height: 24px; }
+
+        .loading-spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(66,133,244,.3); border-top-color: #4285f4; border-radius: 50%; animation: spin 0.9s linear infinite; vertical-align: middle; margin-right: 6px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* 新增：特殊表单提取面板 */
+        .form-mode-box { margin-bottom: 16px; padding: 14px; border: 1px solid #eee; border-radius: 8px; background: #fafafa; }
+        .form-mode-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+        .form-mode-row label { font-size: 14px; color: #444; white-space: nowrap; }
+        #formTypeSelect { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid #ddd; border-radius: 6px; background: white; font-size: 14px; color: #333; }
+        .mode-desc { font-size: 12px; color: #666; line-height: 1.6; }
+        #specialFileList { margin: 16px 0 0; max-height: 320px; overflow-y: auto; border: 1px solid #eee; border-radius: 8px; display: none; }
+        #specialStatus { margin-top: 14px; font-size: 14px; color: #555; text-align: center; min-height: 24px; }
+        .batch-result { margin-top: 14px; padding: 12px; border-radius: 8px; background: #f6fff8; border: 1px solid #d8f0df; font-size: 14px; display: none; }
+        .batch-result-title { color: #1e8e3e; font-weight: 600; margin-bottom: 6px; }
+
+        @media (max-width: 760px) {
+            body { padding: 12px; }
+            .app-shell { flex-direction: column; max-width: 600px; gap: 0; }
+            .sidebar { width: 100%; margin-top: 0; }
+            .right-area { width: 100%; }
+            .card { margin-top: 16px; }
+        }
+    </style>
+</head>
+<body>
+<div class="app-shell">
+    <aside class="sidebar">
+        <div class="sidebar-title">OCR批处理任务</div>
+        <button class="nav-item active" data-panel="wordPanel">● PDF转Word</button>
+        <button class="nav-item" data-panel="specialPanel">○ 特殊表单提取</button>
+    </aside>
+
+    <main class="right-area">
+        <!-- PDF转Word：保留原有前端主体与逻辑 -->
+        <section id="wordPanel" class="panel">
+            <div class="card">
+                <h2>PDF to Word OCR</h2>
+
+                <div class="drop-zone" id="dropZone">
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    <p>点击选择或拖拽文件到这里（支持多选）</p>
+                    <small>支持 .pdf · .jpg · .png · .jpeg</small>
+                </div>
+                <input type="file" id="fileInput" hidden accept=".pdf,.png,.jpg,.jpeg" multiple>
+
+                <div id="fileList"></div>
+
+                <div class="options">
+                    <label><input type="checkbox" id="keepRef" checked> 保留签批区</label>
+                    <label><input type="checkbox" id="removeRedSeal"> 去除红章</label>
+                    <label style="color:#e67e22; font-size:12px;" title="强制走完整OCR流程，跳过pdf2docx直接转换。仅供开发调试使用。">
+                        <input type="checkbox" id="forceOcr"> temp（开发测试用）强制使用OCR
+                    </label>
+                </div>
+
+                <button id="uploadBtn" class="btn-convert" disabled>开始转换（0 个文件）</button>
+                <div id="status"></div>
+            </div>
+        </section>
+
+        <!-- 特殊表单提取：新增独立面板，不复用 PDF转Word 的 id 与 JS 状态 -->
+        <section id="specialPanel" class="panel" style="display:none;">
+            <div class="card">
+                <h2>特殊表单提取</h2>
+
+                <div class="form-mode-box">
+                    <div class="form-mode-row">
+                        <label for="formTypeSelect">表单类型：</label>
+                        <select id="formTypeSelect">
+                            <option value="contract_esign">合同电子签章</option>
+                            <option value="digital_cert_application">电子签章平台数字证书申请表</option>
+                        </select>
+                    </div>
+                    <div class="mode-desc" id="formTypeDesc">
+                        当前模式：合同电子签章。系统将提取合同电子签章相关字段，并导出为Excel。
+                    </div>
+                </div>
+
+                <div class="drop-zone" id="specialDropZone">
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    <p>点击选择或拖拽文件到这里（支持多选）</p>
+                    <small>支持 .docx· .pdf · .jpg · .png · .jpeg</small>
+                </div>
+                <input type="file" id="specialFileInput" hidden accept=".pdf,.png,.jpg,.jpeg,.docx" multiple>
+
+                <div id="specialFileList"></div>
+
+                <div class="options" id="specialOptions">
+                    <label><input type="checkbox" id="specialRemoveRedSeal" checked> 去除红章</label>
+                </div>
+
+                <button id="specialUploadBtn" class="btn-convert" disabled>开始提取并导出Excel（0 个文件）</button>
+                <div id="specialStatus"></div>
+
+                <div class="batch-result" id="specialBatchResult"></div>
+            </div>
+        </section>
+    </main>
+</div>
+
+<script>
+    // ── 左侧栏切换：只负责切换显示，不改变 PDF转Word 原有逻辑 ─────────
+    document.querySelectorAll('.nav-item').forEach(btn => {
+        btn.onclick = () => {
+            const targetPanel = btn.dataset.panel;
+
+            document.querySelectorAll('.nav-item').forEach(b => {
+                b.classList.remove('active');
+                if (b.dataset.panel === 'wordPanel') b.textContent = '○ PDF转Word';
+                if (b.dataset.panel === 'specialPanel') b.textContent = '○ 特殊表单提取';
+            });
+
+            btn.classList.add('active');
+            if (targetPanel === 'wordPanel') btn.textContent = '● PDF转Word';
+            if (targetPanel === 'specialPanel') btn.textContent = '● 特殊表单提取';
+
+            document.getElementById('wordPanel').style.display = targetPanel === 'wordPanel' ? 'flex' : 'none';
+            document.getElementById('specialPanel').style.display = targetPanel === 'specialPanel' ? 'flex' : 'none';
+        };
+    });
+
+    // ─────────────────────────────────────────────────────────────
+    // PDF转Word：下面这一段是原有逻辑，保持 /upload 串行转换逻辑
+    // ─────────────────────────────────────────────────────────────
+    const dropZone   = document.getElementById('dropZone');
+    const fileInput  = document.getElementById('fileInput');
+    const uploadBtn  = document.getElementById('uploadBtn');
+    const fileList   = document.getElementById('fileList');
+    const statusDiv  = document.getElementById('status');
+
+    let files = [];   // { file: File, state: 'waiting'|'running'|'done'|'error', result: null }
+
+    // ── 文件管理 ──────────────────────────────────────
+    function addFiles(newFiles) {
+        for (const f of newFiles) {
+            const dup = files.find(e => e.file.name === f.name && e.file.size === f.size);
+            if (!dup) files.push({ file: f, state: 'waiting', result: null });
+        }
+        render();
+    }
+
+    function removeFile(idx) {
+        files.splice(idx, 1);
+        render();
+    }
+
+    // ── 渲染文件列表 ──────────────────────────────────
+    function render() {
+        if (files.length === 0) {
+            fileList.style.display = 'none';
+            fileList.innerHTML = '';
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = '开始转换（0 个文件）';
+            return;
+        }
+        fileList.style.display = 'block';
+        const allDone = files.every(e => e.state === 'done' || e.state === 'error');
+        const running = files.some(e => e.state === 'running');
+        uploadBtn.disabled = running;
+        uploadBtn.textContent = allDone
+            ? `重新转换（${files.length} 个文件）`
+            : `开始转换（${files.length} 个文件）`;
+
+        fileList.innerHTML = files.map((entry, i) => {
+            const badgeClass = {
+                waiting: 'badge-waiting',
+                running: 'badge-running',
+                done:    'badge-done',
+                error:   'badge-error'
+            }[entry.state];
+
+            const badgeLabel = {
+                waiting: '等待中',
+                running: '<span class="spinner-sm"></span>转换中',
+                done:    '完成',
+                error:   '失败'
+            }[entry.state];
+
+            const canRemove = entry.state === 'waiting' || entry.state === 'done' || entry.state === 'error';
+
+            let resultHtml = '';
+            if (entry.result) {
+                if (entry.result.download_url) {
+                    resultHtml = `<div class="file-result"><a class="download-link" href="${entry.result.download_url}" target="_blank">⬇ 下载 ${entry.result.filename}</a></div>`;
+                } else if (entry.result.error) {
+                    resultHtml = `<div class="file-result"><span class="error-text">✗ ${entry.result.error}</span></div>`;
+                }
+            }
+
+            return `
+            <div class="file-item" id="fi-${i}">
+                <span class="file-name">${entry.file.name}</span>
+                <span class="badge ${badgeClass}">${badgeLabel}</span>
+                <button class="remove-btn" onclick="removeFile(${i})" ${canRemove ? '' : 'disabled'} title="移除">✕</button>
+                ${resultHtml}
+            </div>`;
+        }).join('');
+    }
+
+    // ── 单文件转换 ────────────────────────────────────
+    async function convertOne(idx) {
+        const entry = files[idx];
+        entry.state = 'running';
+        entry.result = null;
+        render();
+
+        const fd = new FormData();
+        fd.append('file', entry.file);
+        fd.append('keep_reference', document.getElementById('keepRef').checked);
+        fd.append('force_ocr', document.getElementById('forceOcr').checked);
+        const removeRedSealCheck = document.getElementById('removeRedSeal');
+        if(removeRedSealCheck) {
+            fd.append('remove_red_seal', removeRedSealCheck.checked);
+        }
+
+        try {
+            const resp = await fetch('/upload', { method: 'POST', body: fd });
+            const data = await resp.json();
+            entry.result = data;
+            entry.state = data.download_url ? 'done' : 'error';
+        } catch (err) {
+            entry.result = { error: '网络错误: ' + err.message };
+            entry.state = 'error';
+        }
+        render();
+    }
+
+    // ── 批量转换（逐个串行，避免 GPU 并发冲突） ────────
+    uploadBtn.onclick = async () => {
+        if (files.length === 0) return;
+        uploadBtn.disabled = true;
+
+        // 重置所有已完成项以便重新转换
+        files.forEach(e => { e.state = 'waiting'; e.result = null; });
+        render();
+
+        let done = 0;
+        for (let i = 0; i < files.length; i++) {
+            statusDiv.innerHTML = `<span class="loading-spinner"></span>正在转换 ${i + 1} / ${files.length}：${files[i].file.name}`;
+            await convertOne(i);
+            done++;
+        }
+
+        const ok  = files.filter(e => e.state === 'done').length;
+        const err = files.filter(e => e.state === 'error').length;
+        statusDiv.textContent = err === 0
+            ? `✅ 全部完成，共 ${ok} 个文件转换成功`
+            : `完成：${ok} 成功 / ${err} 失败`;
+
+        render();
+    };
+
+    // ── 文件选择 / 拖拽 ───────────────────────────────
+    dropZone.onclick = () => fileInput.click();
+
+    fileInput.onchange = (e) => {
+        addFiles(Array.from(e.target.files));
+        fileInput.value = '';   // 允许再次选同文件
+    };
+
+    dropZone.ondragover  = (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); };
+    dropZone.ondragleave = ()  => dropZone.classList.remove('drag-over');
+    dropZone.ondrop      = (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('drag-over');
+        addFiles(Array.from(e.dataTransfer.files).filter(f =>
+            /\.(pdf|png|jpe?g)$/i.test(f.name)
+        ));
+    };
+
+    // ─────────────────────────────────────────────────────────────
+    // 特殊表单提取：独立状态、独立上传区、独立接口
+    // ─────────────────────────────────────────────────────────────
+    const specialDropZone = document.getElementById('specialDropZone');
+    const specialFileInput = document.getElementById('specialFileInput');
+    const specialUploadBtn = document.getElementById('specialUploadBtn');
+    const specialFileList = document.getElementById('specialFileList');
+    const specialStatus = document.getElementById('specialStatus');
+    const specialBatchResult = document.getElementById('specialBatchResult');
+    const formTypeSelect = document.getElementById('formTypeSelect');
+    const formTypeDesc = document.getElementById('formTypeDesc');
+
+    let specialFiles = [];  // { file: File, state: 'waiting'|'running'|'done'|'error', result: null }
+
+    formTypeSelect.onchange = () => {
+        updateFormTypeDesc();
+        specialBatchResult.style.display = 'none';
+        specialBatchResult.innerHTML = '';
+        specialStatus.textContent = '';
+        specialFiles.forEach(e => { e.state = 'waiting'; e.result = null; });
+        renderSpecial();
+    };
+
+    function updateFormTypeDesc() {
+        if (formTypeSelect.value === 'contract_esign') {
+            formTypeDesc.textContent = '当前模式：合同电子签章。系统将提取合同电子签章相关字段，并导出为Excel。';
+        } else if (formTypeSelect.value === 'digital_cert_application') {
+            formTypeDesc.textContent = '当前模式：电子签章平台数字证书申请表。提取特殊字段并导出Excel。';
+        }
+    }
+
+    function addSpecialFiles(newFiles) {
+        for (const f of newFiles) {
+            const dup = specialFiles.find(e => e.file.name === f.name && e.file.size === f.size);
+            if (!dup) specialFiles.push({ file: f, state: 'waiting', result: null });
+        }
+        specialBatchResult.style.display = 'none';
+        specialBatchResult.innerHTML = '';
+        renderSpecial();
+    }
+
+    function removeSpecialFile(idx) {
+        specialFiles.splice(idx, 1);
+        renderSpecial();
+    }
+
+    function renderSpecial() {
+        if (specialFiles.length === 0) {
+            specialFileList.style.display = 'none';
+            specialFileList.innerHTML = '';
+            specialUploadBtn.disabled = true;
+            specialUploadBtn.textContent = '开始提取并导出Excel（0 个文件）';
+            return;
+        }
+
+        specialFileList.style.display = 'block';
+        const allDone = specialFiles.every(e => e.state === 'done' || e.state === 'error');
+        const running = specialFiles.some(e => e.state === 'running');
+        specialUploadBtn.disabled = running;
+        specialUploadBtn.textContent = allDone
+            ? `重新提取并导出Excel（${specialFiles.length} 个文件）`
+            : `开始提取并导出Excel（${specialFiles.length} 个文件）`;
+
+        specialFileList.innerHTML = specialFiles.map((entry, i) => {
+            const badgeClass = {
+                waiting: 'badge-waiting',
+                running: 'badge-running',
+                done:    'badge-done',
+                error:   'badge-error'
+            }[entry.state];
+
+            const badgeLabel = {
+                waiting: '等待中',
+                running: '<span class="spinner-sm"></span>提取中',
+                done:    '完成',
+                error:   '失败'
+            }[entry.state];
+
+            const canRemove = entry.state === 'waiting' || entry.state === 'done' || entry.state === 'error';
+
+            let resultHtml = '';
+            if (entry.result && entry.result.error) {
+                resultHtml = `<div class="file-result"><span class="error-text">✗ ${entry.result.error}</span></div>`;
+            }
+
+            return `
+            <div class="file-item" id="sfi-${i}">
+                <span class="file-name">${entry.file.name}</span>
+                <span class="badge ${badgeClass}">${badgeLabel}</span>
+                <button class="remove-btn" onclick="removeSpecialFile(${i})" ${canRemove ? '' : 'disabled'} title="移除">✕</button>
+                ${resultHtml}
+            </div>`;
+        }).join('');
+    }
+
+    async function runSpecialExtract() {
+        if (specialFiles.length === 0) return;
+
+        specialUploadBtn.disabled = true;
+        specialBatchResult.style.display = 'none';
+        specialBatchResult.innerHTML = '';
+
+        specialFiles.forEach(e => { e.state = 'running'; e.result = null; });
+        renderSpecial();
+
+        const fd = new FormData();
+        fd.append('form_type', formTypeSelect.value);
+        const specialRemoveRedSealCheck = document.getElementById('specialRemoveRedSeal');
+        if(specialRemoveRedSealCheck) {
+            fd.append('remove_red_seal', specialRemoveRedSealCheck.checked);
+        }
+        specialFiles.forEach(entry => fd.append('files', entry.file));
+
+        try {
+            specialStatus.innerHTML = `<span class="loading-spinner"></span>正在提取特殊表单字段并生成Excel`;
+
+            const resp = await fetch('/extract_special_form', { method: 'POST', body: fd });
+            const data = await resp.json();
+
+            if (data.download_url) {
+                specialFiles.forEach(e => { e.state = 'done'; e.result = null; });
+
+                const filename = data.filename || '特殊表单提取结果.xlsx';
+                specialStatus.textContent = `✅ 提取完成，共 ${specialFiles.length} 个文件`;
+                specialBatchResult.style.display = 'block';
+                specialBatchResult.innerHTML = `
+                    <div class="batch-result-title">批次结果</div>
+                    <a class="download-link" href="${data.download_url}" target="_blank">⬇ 下载 ${filename}</a>
+                `;
+            } else {
+                specialFiles.forEach(e => { e.state = 'error'; e.result = { error: data.error || '特殊表单提取失败' }; });
+                specialStatus.textContent = data.error || '特殊表单提取失败';
+            }
+        } catch (err) {
+            specialFiles.forEach(e => { e.state = 'error'; e.result = { error: '网络错误: ' + err.message }; });
+            specialStatus.textContent = '网络错误: ' + err.message;
+        }
+
+        renderSpecial();
+    }
+
+    specialUploadBtn.onclick = runSpecialExtract;
+
+    specialDropZone.onclick = () => specialFileInput.click();
+
+    specialFileInput.onchange = (e) => {
+        addSpecialFiles(Array.from(e.target.files));
+        specialFileInput.value = '';
+    };
+
+    specialDropZone.ondragover = (e) => { e.preventDefault(); specialDropZone.classList.add('drag-over'); };
+    specialDropZone.ondragleave = () => specialDropZone.classList.remove('drag-over');
+    specialDropZone.ondrop = (e) => {
+        e.preventDefault();
+        specialDropZone.classList.remove('drag-over');
+        addSpecialFiles(Array.from(e.dataTransfer.files).filter(f =>
+            /\.(pdf|png|jpe?g|docx)$/i.test(f.name)
+        ));
+    };
+</script>
+</body>
+</html>

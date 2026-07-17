@@ -1,0 +1,117 @@
+Global:
+  use_gpu: true
+  epoch_num: 25
+  log_smooth_window: 10
+  print_batch_step: 5
+  save_model_dir: /data/kath/models/det/retrain_temp
+  save_epoch_step: 100
+  eval_batch_step:
+  - 0
+  - 10000
+  cal_metric_during_train: false
+  pretrained_model: /data/kath/models/det/retrain/3月6日模型/latest
+  checkpoints: #/data/kath/sources/PaddleOCR-release-2.7/output/det/best_model/model
+  save_inference_dir: null
+  use_visualdl: false
+  infer_img: null
+  save_res_path: /data/tensorflow/kath/Data/OCR/Final/traindata/predict_res.txt
+Architecture:
+  model_type: det
+  algorithm: CT
+  Transform: null
+  Backbone:
+    name: ResNet_vd
+    layers: 18
+  Neck:
+    name: CTFPN
+  Head:
+    name: CT_Head
+    in_channels: 512
+    hidden_dim: 128
+    num_classes: 3
+Loss:
+  name: CTLoss
+Optimizer:
+  name: Adam
+  lr:
+    name: Linear
+    learning_rate: 0.008
+    end_lr: 5.0e-06
+    epochs: 5
+    step_each_epoch: null
+    power: 0.9
+PostProcess:
+  name: CTPostProcess
+  box_type: poly #rect
+  det_box_type: poly #rect
+Metric:
+  name: CTMetric
+  main_indicator: f_score
+Train:
+  dataset:
+    name: SimpleDataSet
+    data_dir: /data/kath/data/官方数据/small
+    label_file_list:
+    - /data/kath/data/官方数据/small/Label.txt
+    ratio_list:
+    - 1.0
+    transforms:
+    - DecodeImage:
+        img_mode: RGB
+        channel_first: false
+    - CTLabelEncode: null
+    - RandomScale: null
+    - MakeShrink: null
+    - GroupRandomHorizontalFlip: null
+    - GroupRandomRotate: null
+    - GroupRandomCropPadding: null
+    - MakeCentripetalShift: null
+    - ColorJitter:
+        brightness: 0.125
+        saturation: 0.5
+    - ToCHWImage: null
+    - NormalizeImage: null
+    - KeepKeys:
+        keep_keys:
+        - image
+        - gt_kernel
+        - training_mask
+        - gt_instance
+        - gt_kernel_instance
+        - training_mask_distance
+        - gt_distance
+  loader:
+    shuffle: true
+    drop_last: true
+    batch_size_per_card: 32
+    num_workers: 0
+Eval:
+  dataset:
+    name: SimpleDataSet
+    data_dir: /data/tensorflow/kath/Data/OCR/Final/eval_oridata #/data/tensorflow/kath/Data/OCR/Final/traindata
+    label_file_list:
+    # - /data/tensorflow/kath/Data/OCR/Final/traindata/Label.txt
+    - /data/tensorflow/kath/Data/OCR/Final/eval_oridata/Label.txt
+    ratio_list:
+    - 1
+    transforms:
+    - DecodeImage:
+        img_mode: RGB
+        channel_first: false
+    - CTLabelEncode: null
+    - ScaleAlignedShort: null
+    - NormalizeImage:
+        order: hwc
+    - ToCHWImage: null
+    - KeepKeys:
+        keep_keys:
+        - image
+        - shape
+        - polys
+        - texts
+  loader:
+    shuffle: false
+    drop_last: false
+    batch_size_per_card: 1
+    num_workers: 0
+profiler_options: null

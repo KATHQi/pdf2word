@@ -1,0 +1,13 @@
+paddlepaddle
+paddleocr
+opencv-python
+numpy
+pandas
+Flask
+Flask-Cors
+pdf2docx
+python-docx
+PyMuPDF
+beautifulsoup4
+shapely
+pyclipper
