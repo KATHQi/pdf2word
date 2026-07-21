@@ -904,10 +904,12 @@ def parse_party_block(role: str, block: str) -> Dict[str, Any]:
     name = name[:80]
 
     address = first_match([
+        r"(?:住所地|住所|住址|户籍住址|现住址)\s*[:：]?\s*(.*?)(?=[,，]\s*(?:身份证|公民身|统一社会|联系|电话|手机|法定|负责)|[。；;\n]|$)",
         r"(?:住所地|住所|住址|户籍住址|现住址)\s*[:：]?\s*([^。；;\n]{2,120})",
     ], block)
     phone = first_match([
         r"(?:联系电话|电话|手机)\s*[:：]?\s*([0-9Xx*\-—()（）]{5,30})",
+
     ], block)
     id_no = first_match([
         r"(?:公民身份号码|身份证号码|身份证号)\s*[:：]?\s*([0-9Xx*\\\-]{6,30})",
@@ -1249,10 +1251,12 @@ def extract_civil_complaint(builder: ExtractionBuilder) -> None:
     evidence = extract_section(text, ["证据清单"], [])
     amount = request_amount_summary(requests)
     request_types = classify_request_type(requests)
-    laws = extract_laws(text)
+    # “法律依据”按“证据清单”来写
+    laws = evidence
 
     if requests:
-        builder.add("requests", raw=requests, normalized=split_numbered_items(requests), confidence=0.95, level="direct", value_type="array")
+        # 修改请求明细为直接写入段落文本
+        builder.add("requests", raw=requests, normalized=requests, confidence=0.95, level="direct", value_type="text")
     if facts:
         builder.add("facts", facts, confidence=0.94, level="direct", value_type="text")
     if amount:
@@ -1268,10 +1272,9 @@ def extract_civil_complaint(builder: ExtractionBuilder) -> None:
     if request_types:
         builder.add("main_request_type", request_types, confidence=0.78, level="conditional", value_type="array", evidence_value=requests)
     if laws:
-        builder.add("laws", laws, confidence=0.8, level="conditional", note="仅返回文书明示的法律名称和条文，不补造法条。", value_type="array")
-    if evidence:
-        builder.add("evidence_list", split_numbered_items(evidence), confidence=0.92, level="direct", value_type="array")
+        builder.add("laws", laws, confidence=0.8, level="conditional", note="按照需求，法律依据取证据清单的内容。", value_type="text")
     extract_common_date(builder, "document_date", level="direct", confidence=0.9)
+
 
 
 def extract_summons(builder: ExtractionBuilder) -> None:

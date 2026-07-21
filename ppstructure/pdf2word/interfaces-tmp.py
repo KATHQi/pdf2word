@@ -479,6 +479,84 @@ def _process_uploaded_file(
     return result
 
 
+
+# ---------------------------------------------------------------------------
+# 简化 JSON 返回
+# ---------------------------------------------------------------------------
+
+
+def _build_key_value_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """仅保留人工测试和前端联调所需的关键 key-value。
+
+    不返回全文、bbox、置信度、证据位置、内部字段对象等详细信息。
+    不生成 HTML。
+    """
+    classification = result.get("classification") or {}
+    patch = result.get("frontend_patch") or {}
+
+    review_required: Dict[str, Any] = {}
+    for label, detail in (patch.get("review_required") or {}).items():
+        if isinstance(detail, dict) and "value" in detail:
+            review_required[str(label)] = detail.get("value")
+        else:
+            review_required[str(label)] = detail
+
+    blocked: Dict[str, str] = {}
+    for detail in patch.get("blocked") or []:
+        if isinstance(detail, dict):
+            label = detail.get("frontend_label") or detail.get("key")
+            if label:
+                blocked[str(label)] = str(detail.get("reason") or "禁止自动填充")
+        elif detail:
+            blocked[str(detail)] = "禁止自动填充"
+
+    return {
+        "document": {
+            "document_type": (
+                classification.get("document_type_name")
+                or classification.get("page_name")
+                or classification.get("document_type")
+                or "未识别"
+            ),
+            "page_code": classification.get("page_code") or patch.get("page_code"),
+            "page_name": classification.get("page_name") or patch.get("page_name"),
+            "stage": classification.get("stage_name") or classification.get("stage"),
+        },
+        "safe_autofill": patch.get("safe_autofill") or {},
+        "review_required": review_required,
+        "blocked": blocked,
+    }
+
+
+def _build_visual_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """将完整批量结果转换成按文件分组、按等级区分的简化 JSON。"""
+    simplified_results: List[Dict[str, Any]] = []
+
+    for item in payload.get("results", []):
+        simplified: Dict[str, Any] = {
+            "index": item.get("index"),
+            "filename": item.get("filename"),
+            "success": bool(item.get("success")),
+        }
+        if item.get("success"):
+            simplified.update(_build_key_value_result(item.get("result") or {}))
+        else:
+            simplified["error"] = item.get("error") or "处理失败"
+            if item.get("error_type"):
+                simplified["error_type"] = item.get("error_type")
+        simplified_results.append(simplified)
+
+    return {
+        "task_id": payload.get("task_id"),
+        "success": payload.get("success"),
+        "visual": 1,
+        "total": payload.get("total"),
+        "success_count": payload.get("success_count"),
+        "failure_count": payload.get("failure_count"),
+        "results": simplified_results,
+    }
+
+
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
@@ -527,7 +605,9 @@ def extract_legal_fields() -> Any:
       - remove_red_seal: 可选，默认 false；
       - document_type: 可选，文种提示；
       - include_raw_text: 可选，默认 false；
-      - include_layout_text: 可选，默认 false。
+      - include_layout_text: 可选，默认 false；
+      - visual: 可选，默认 0。visual=0 返回完整 JSON；visual=1 仅返回
+        按文件分组、按等级区分的关键 key-value 简化 JSON。
     """
     storages = [storage for storage in request.files.getlist("files") if storage and storage.filename]
     if not storages:
@@ -587,16 +667,21 @@ def extract_legal_fields() -> Any:
     if success_count == 0:
         status_code = 500 if has_server_error else 400
 
-    return jsonify(
-        {
-            "task_id": str(uuid.uuid4()),
-            "success": success_count > 0,
-            "total": len(results),
-            "success_count": success_count,
-            "failure_count": failure_count,
-            "results": results,
-        }
-    ), status_code
+    payload: Dict[str, Any] = {
+        "task_id": str(uuid.uuid4()),
+        "success": success_count > 0,
+        "total": len(results),
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "results": results,
+    }
+
+    # visual=0：保持原有完整 JSON，不改变任何字段。
+    # visual=1：完全放弃 HTML，只返回按文件和等级组织的简化 key-value JSON。
+    if _as_bool(request.form.get("visual"), False):
+        return jsonify(_build_visual_payload(payload)), status_code
+
+    return jsonify(payload), status_code
 
 
 # 保留旧接口名，方便原临时调用方迁移；请求参数与新接口完全相同。
