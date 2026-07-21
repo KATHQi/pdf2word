@@ -1,5 +1,7 @@
 """PDF2Word 法务字段提取接口（端到端、内存处理版）。
 
+2026-07-21：批量 results 的每个文件对象新增顶层 document_type 字段。
+
 处理链路：
     上传 PDF / 图片
         -> 复用现有 web_server.py 中已经初始化的 PP-Structure predictor
@@ -506,6 +508,25 @@ def _process_uploaded_file(
 
 
 # ---------------------------------------------------------------------------
+# 返回结果辅助函数
+# ---------------------------------------------------------------------------
+
+
+def _get_document_type(result: Dict[str, Any]) -> str:
+    """从完整法务提取结果中读取统一的文书类型名称。"""
+    classification = result.get("classification") or {}
+    patch = result.get("frontend_patch") or {}
+    return str(
+        classification.get("document_type_name")
+        or classification.get("page_name")
+        or classification.get("document_type")
+        or patch.get("page_name")
+        or patch.get("document_type")
+        or "未识别"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 简化 JSON 返回
 # ---------------------------------------------------------------------------
 
@@ -537,12 +558,7 @@ def _build_key_value_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "document": {
-            "document_type": (
-                classification.get("document_type_name")
-                or classification.get("page_name")
-                or classification.get("document_type")
-                or "未识别"
-            ),
+            "document_type": _get_document_type(result),
             "page_code": classification.get("page_code") or patch.get("page_code"),
             "page_name": classification.get("page_name") or patch.get("page_name"),
             "stage": classification.get("stage_name") or classification.get("stage"),
@@ -561,6 +577,7 @@ def _build_visual_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         simplified: Dict[str, Any] = {
             "index": item.get("index"),
             "filename": item.get("filename"),
+            "document_type": item.get("document_type"),
             "success": bool(item.get("success")),
         }
         if item.get("success"):
@@ -660,6 +677,8 @@ def extract_legal_fields() -> Any:
         item: Dict[str, Any] = {
             "index": index,
             "filename": filename,
+            # 多文件返回中始终保留该键；成功后会替换为实际识别类型。
+            "document_type": document_type_hint,
         }
         try:
             result = _process_uploaded_file(
@@ -671,6 +690,7 @@ def extract_legal_fields() -> Any:
                 include_raw_text=include_raw_text,
                 include_layout_text=include_layout_text,
             )
+            item["document_type"] = _get_document_type(result)
             item["success"] = True
             item["result"] = result
             success_count += 1
