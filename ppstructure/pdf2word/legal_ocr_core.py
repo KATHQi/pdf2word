@@ -1,3 +1,9 @@
+"""从 PDF 转 Word 最终 DOCX 中读取文本并提取法务字段。
+
+本模块只处理已经生成的 Word 文档，不包含 OCR、PDF 渲染、图片识别、
+PaddleOCR 或 PP-Structure 初始化逻辑。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -6,7 +12,15 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+
+from docx import Document
+from docx.document import Document as _Document
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +370,151 @@ ROLE_LABELS = [
     "被执行人",
     "被传唤人",
 ]
+
+
+
+# ---------------------------------------------------------------------------
+# Final DOCX reader
+# ---------------------------------------------------------------------------
+
+
+def _iter_docx_blocks(parent: _Document) -> Iterator[Union[Paragraph, Table]]:
+    """按 Word 正文中的真实顺序遍历段落和表格。"""
+    parent_element = parent.element.body
+    for child in parent_element.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
+
+
+def _unique_table_cells(row: Any) -> List[str]:
+    """去除合并单元格在 python-docx ``row.cells`` 中产生的重复引用。"""
+    result: List[str] = []
+    seen: set[int] = set()
+    for cell in row.cells:
+        marker = id(cell._tc)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        text = normalize_text(cell.text)
+        if text:
+            result.append(text)
+    return result
+
+
+def read_docx_source(
+    docx_path: Union[str, Path],
+    filename: Optional[str] = None,
+) -> SourceDocument:
+    """读取 PDF 转 Word 界面已经导出的最终 DOCX。
+
+    读取内容包括：
+    - 正文段落；
+    - 表格单元格；
+    - 当恢复结果使用文本框等特殊 XML 结构且常规段落为空时，
+      使用 ``w:t`` 文本节点作为兜底。
+
+    本函数不会执行任何 OCR，也不会读取原始 PDF 或图片。
+    """
+    path = Path(docx_path).resolve()
+    if path.suffix.lower() != ".docx":
+        raise ValueError("read_docx_source 仅支持 .docx 文件")
+    if not path.is_file():
+        raise FileNotFoundError(f"Word 文件不存在：{path}")
+
+    document = Document(str(path))
+    lines: List[TextLine] = []
+    text_parts: List[str] = []
+    block_index = 0
+
+    for block in _iter_docx_blocks(document):
+        if isinstance(block, Paragraph):
+            text = normalize_text(block.text)
+            if text:
+                lines.append(
+                    TextLine(
+                        text=text,
+                        paragraph=block_index,
+                        block_type="paragraph",
+                    )
+                )
+                text_parts.append(text)
+                block_index += 1
+            continue
+
+        for row in block.rows:
+            cells = _unique_table_cells(row)
+            if not cells:
+                continue
+            row_text = " | ".join(cells)
+            lines.append(
+                TextLine(
+                    text=row_text,
+                    paragraph=block_index,
+                    block_type="table_row",
+                )
+            )
+            text_parts.append(row_text)
+            block_index += 1
+
+    # 部分版面恢复结果可能将文字放在文本框中，python-docx 的 paragraphs
+    # 不一定能读取。只有当正文文本不足时才启用 XML 文本节点兜底，避免重复。
+    primary_text = "\n".join(text_parts).strip()
+    warnings: List[str] = []
+    if len(normalize_for_match(primary_text)) < 30:
+        xml_texts = [
+            normalize_text(node.text)
+            for node in document.element.xpath(".//w:t")
+            if getattr(node, "text", None) and normalize_text(node.text)
+        ]
+        xml_text = "\n".join(xml_texts).strip()
+        if len(normalize_for_match(xml_text)) > len(normalize_for_match(primary_text)):
+            lines = [
+                TextLine(text=value, paragraph=index, block_type="xml_text")
+                for index, value in enumerate(xml_texts)
+            ]
+            text_parts = xml_texts
+            primary_text = xml_text
+            warnings.append("常规段落文本较少，已从 Word XML 文本节点读取恢复内容。")
+
+    # 补充页眉、页脚中的文本；按节去重。
+    header_footer_seen: set[str] = set()
+    for section in document.sections:
+        for part, block_type in (
+            (section.header, "header"),
+            (section.footer, "footer"),
+        ):
+            for paragraph in part.paragraphs:
+                value = normalize_text(paragraph.text)
+                key = normalize_for_match(value)
+                if not value or not key or key in header_footer_seen:
+                    continue
+                header_footer_seen.add(key)
+                lines.append(
+                    TextLine(
+                        text=value,
+                        paragraph=block_index,
+                        block_type=block_type,
+                    )
+                )
+                text_parts.append(value)
+                block_index += 1
+
+    full_text = normalize_text("\n".join(text_parts))
+    if not full_text:
+        warnings.append("最终 Word 中未读取到可提取文本；请确认转换结果不是纯图片。")
+
+    return SourceDocument(
+        filename=filename or path.name,
+        extension=".docx",
+        text=full_text,
+        lines=lines,
+        extraction_method="final_docx",
+        page_count=None,
+        sha256=file_sha256(str(path)),
+        warnings=warnings,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1542,10 +1701,10 @@ def api_schema() -> Dict[str, Any]:
             "direct": "文书存在明确同义字段，可在置信度足够时安全自动回填。",
             "conditional": "需要推断、计算、角色匹配或样本并非全部具备，必须进入复核区。",
             "unavailable": "当前文书没有该信息或语义不等价，保持空值。",
-            "system": "平台或人工流程字段，OCR不得覆盖。",
+            "system": "平台或人工流程字段，Word 文书提取不得覆盖。",
         },
         "field_contract": {
-            "raw_value": "OCR/文本层原始值",
+            "raw_value": "最终 Word 中提取到的原始值",
             "normalized_value": "标准化后值",
             "confidence": "0-1 置信度",
             "mapping_level": "direct/conditional/unavailable/system",
