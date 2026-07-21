@@ -518,45 +518,85 @@ def schemas() -> Any:
 
 @app.post("/api/v1/legal/extract")
 def extract_legal_fields() -> Any:
-    """端到端上传接口。
+    """端到端上传接口（支持多文件）。
 
     multipart/form-data：
-      - file: 必填，PDF 或图片；
+      - files: 必填，支持多个 PDF / 图片；
+      - file: 兼容旧调用，单文件；
       - force_ocr: 可选，默认 false；
       - remove_red_seal: 可选，默认 false；
       - document_type: 可选，文种提示；
       - include_raw_text: 可选，默认 false；
       - include_layout_text: 可选，默认 false。
     """
-    storage = request.files.get("file")
-    if storage is None or not storage.filename:
-        return jsonify({"error": "未收到文件；multipart 字段名必须为 file"}), 400
+    storages = [storage for storage in request.files.getlist("files") if storage and storage.filename]
+    if not storages:
+        single = request.files.get("file")
+        if single is not None and single.filename:
+            storages = [single]
 
-    filename = _safe_filename(storage.filename)
-    data = storage.stream.read()
+    if not storages:
+        return jsonify({"error": "未收到文件；multipart 字段名请使用 files（多文件）或 file（单文件）"}), 400
 
-    try:
-        result = _process_uploaded_file(
-            data=data,
-            filename=filename,
-            force_ocr=_as_bool(request.form.get("force_ocr"), False),
-            remove_red_seal=_as_bool(request.form.get("remove_red_seal"), False),
-            document_type_hint=request.form.get("document_type") or None,
-            include_raw_text=_as_bool(request.form.get("include_raw_text"), False),
-            include_layout_text=_as_bool(request.form.get("include_layout_text"), False),
-        )
-        return jsonify(
-            {
-                "task_id": str(uuid.uuid4()),
-                "success": True,
-                "result": result,
-            }
-        )
-    except ValueError as exc:
-        return jsonify({"success": False, "error": str(exc)}), 400
-    except Exception as exc:
-        print(traceback.format_exc())
-        return jsonify({"success": False, "error": str(exc)}), 500
+    force_ocr = _as_bool(request.form.get("force_ocr"), False)
+    remove_red_seal = _as_bool(request.form.get("remove_red_seal"), False)
+    document_type_hint = request.form.get("document_type") or None
+    include_raw_text = _as_bool(request.form.get("include_raw_text"), False)
+    include_layout_text = _as_bool(request.form.get("include_layout_text"), False)
+
+    results: List[Dict[str, Any]] = []
+    success_count = 0
+    failure_count = 0
+    has_server_error = False
+
+    for index, storage in enumerate(storages):
+        filename = _safe_filename(storage.filename)
+        data = storage.stream.read()
+        item: Dict[str, Any] = {
+            "index": index,
+            "filename": filename,
+        }
+        try:
+            result = _process_uploaded_file(
+                data=data,
+                filename=filename,
+                force_ocr=force_ocr,
+                remove_red_seal=remove_red_seal,
+                document_type_hint=document_type_hint,
+                include_raw_text=include_raw_text,
+                include_layout_text=include_layout_text,
+            )
+            item["success"] = True
+            item["result"] = result
+            success_count += 1
+        except ValueError as exc:
+            item["success"] = False
+            item["error"] = str(exc)
+            item["error_type"] = "value_error"
+            failure_count += 1
+        except Exception as exc:
+            print(traceback.format_exc())
+            item["success"] = False
+            item["error"] = str(exc)
+            item["error_type"] = "internal_error"
+            failure_count += 1
+            has_server_error = True
+        results.append(item)
+
+    status_code = 200
+    if success_count == 0:
+        status_code = 500 if has_server_error else 400
+
+    return jsonify(
+        {
+            "task_id": str(uuid.uuid4()),
+            "success": success_count > 0,
+            "total": len(results),
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "results": results,
+        }
+    ), status_code
 
 
 # 保留旧接口名，方便原临时调用方迁移；请求参数与新接口完全相同。
