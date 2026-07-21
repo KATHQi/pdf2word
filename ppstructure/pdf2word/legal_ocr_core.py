@@ -860,6 +860,117 @@ def split_numbered_items(text: Optional[str]) -> List[str]:
     return items
 
 
+_NUMBERED_ARABIC_ITEM_RE = re.compile(r"(?m)^\s*(?P<number>\d{1,2})\s*[.．、)]\s*")
+_REQUEST_ACTION_WORDS = (
+    "判令", "请求", "责令", "支付", "偿还", "返还", "退还", "赔偿",
+    "承担", "清偿", "解除", "确认", "撤销", "停止", "腾退", "交付",
+    "办理", "查封", "冻结", "扣押", "保全",
+)
+
+
+def _numbered_blocks(text: Optional[str]) -> Tuple[str, List[Tuple[int, str]]]:
+    """将阿拉伯数字编号段落拆为 ``(前缀, [(序号, 原文), ...])``。"""
+    normalized = normalize_text(text or "")
+    matches = list(_NUMBERED_ARABIC_ITEM_RE.finditer(normalized))
+    if not matches:
+        return normalized, []
+
+    prefix = normalized[: matches[0].start()].strip()
+    items: List[Tuple[int, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        block = normalized[match.start():end].strip()
+        if block:
+            items.append((int(match.group("number")), block))
+    return prefix, items
+
+
+def _take_first_numbered_sentence(text: str) -> Optional[Tuple[int, str, str]]:
+    """从文本开头取出一个编号项，返回 ``(序号, 项文本, 剩余文本)``。
+
+    诉讼请求通常以分号结束；为兼容最后一项，也接受句号。只截取首个
+    终止标点，避免把后续“事实与理由”正文一起吞入编号项。
+    """
+    normalized = normalize_text(text)
+    match = _NUMBERED_ARABIC_ITEM_RE.match(normalized)
+    if not match:
+        return None
+
+    body_start = match.end()
+    terminator = re.search(r"[;。](?=\s*(?:\n|$))", normalized[body_start:])
+    if terminator:
+        end = body_start + terminator.end()
+    else:
+        next_item = _NUMBERED_ARABIC_ITEM_RE.search(normalized, body_start)
+        if not next_item:
+            return None
+        end = next_item.start()
+
+    item = normalized[:end].strip()
+    rest = normalized[end:].lstrip(" \n")
+    return int(match.group("number")), item, rest
+
+
+def _looks_like_request_item(text: str) -> bool:
+    compact = compact_text(text)
+    return any(word in compact for word in _REQUEST_ACTION_WORDS)
+
+
+def repair_civil_complaint_sections(
+    requests: Optional[str],
+    facts: Optional[str],
+) -> Tuple[Optional[str], Optional[str], bool]:
+    """修复 PDF 对象流乱序造成的诉请/事实串段。
+
+    典型异常是：诉讼请求实际为 1、2、3 三项，但 PDF 文字对象流顺序
+    变成 ``1 -> 3 -> 事实与理由 -> 2 -> 事实正文``。此时普通标题切片
+    会把第 2 项误放入“法律事实”。本函数只在“事实”开头编号项能够填补
+    诉请编号缺口（或紧接现有最大编号），且内容具有请求动作语义时移动，
+    从而避免误伤事实正文中正常的编号叙述。
+    """
+    normalized_requests = normalize_text(requests or "") or None
+    normalized_facts = normalize_text(facts or "") or None
+    if not normalized_requests or not normalized_facts:
+        return normalized_requests, normalized_facts, False
+
+    prefix, request_items = _numbered_blocks(normalized_requests)
+    if not request_items:
+        return normalized_requests, normalized_facts, False
+
+    numbers = {number for number, _ in request_items}
+    moved_items: List[Tuple[int, str]] = []
+    remaining_facts = normalized_facts
+
+    while True:
+        candidate = _take_first_numbered_sentence(remaining_facts)
+        if not candidate:
+            break
+        number, item, rest = candidate
+        max_number = max(numbers) if numbers else 0
+        missing_numbers = set(range(1, max_number + 1)) - numbers
+        fills_sequence = number in missing_numbers or number == max_number + 1
+        if not fills_sequence or not _looks_like_request_item(item):
+            break
+        moved_items.append((number, item))
+        numbers.add(number)
+        remaining_facts = rest
+
+    if not moved_items:
+        return normalized_requests, normalized_facts, False
+
+    merged: Dict[int, str] = {}
+    for number, item in request_items + moved_items:
+        # 保留第一次出现的版本；视觉顺序修复只补缺，不覆盖已有诉请。
+        merged.setdefault(number, item)
+
+    ordered_items = [merged[number] for number in sorted(merged)]
+    repaired_requests = "\n".join(
+        [part for part in ([prefix] if prefix else []) + ordered_items if part]
+    ).strip()
+    repaired_facts = remaining_facts.strip() or None
+    return repaired_requests or None, repaired_facts, True
+
+
 def extract_laws(text: str) -> List[str]:
     laws = all_matches(r"《([^》]{2,80})》", text)
     articles = all_matches(r"(第[一二三四五六七八九十百千万0-9]+条(?:第[一二三四五六七八九十0-9]+款)?)", text)
@@ -1249,14 +1360,27 @@ def extract_civil_complaint(builder: ExtractionBuilder) -> None:
     requests = extract_section(text, ["诉讼请求"], ["事实与理由", "事实和理由", "证据清单"])
     facts = extract_section(text, ["事实与理由", "事实和理由"], ["证据清单"])
     evidence = extract_section(text, ["证据清单"], [])
+
+    requests, facts, repaired = repair_civil_complaint_sections(requests, facts)
+    if repaired:
+        builder.warnings.append(
+            "检测到 PDF 文字对象流导致诉讼请求编号串入事实与理由，已按编号连续性和请求语义修复。"
+        )
+
     amount = request_amount_summary(requests)
     request_types = classify_request_type(requests)
-    # “法律依据”按“证据清单”来写
+    # 甲方约定：“法律依据”直接使用“证据清单”段落内容。
     laws = evidence
 
     if requests:
-        # 修改请求明细为直接写入段落文本
-        builder.add("requests", raw=requests, normalized=requests, confidence=0.95, level="direct", value_type="text")
+        builder.add(
+            "requests",
+            raw=requests,
+            normalized=requests,
+            confidence=0.95,
+            level="direct",
+            value_type="text",
+        )
     if facts:
         builder.add("facts", facts, confidence=0.94, level="direct", value_type="text")
     if amount:
@@ -1270,9 +1394,23 @@ def extract_civil_complaint(builder: ExtractionBuilder) -> None:
             evidence_value=requests,
         )
     if request_types:
-        builder.add("main_request_type", request_types, confidence=0.78, level="conditional", value_type="array", evidence_value=requests)
+        builder.add(
+            "main_request_type",
+            request_types,
+            confidence=0.78,
+            level="conditional",
+            value_type="array",
+            evidence_value=requests,
+        )
     if laws:
-        builder.add("laws", laws, confidence=0.8, level="conditional", note="按照需求，法律依据取证据清单的内容。", value_type="text")
+        builder.add(
+            "laws",
+            laws,
+            confidence=0.95,
+            level="direct",
+            note="按甲方字段规则，法律依据直接取证据清单段落。",
+            value_type="text",
+        )
     extract_common_date(builder, "document_date", level="direct", confidence=0.9)
 
 
