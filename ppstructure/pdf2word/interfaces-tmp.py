@@ -322,41 +322,66 @@ def _source_from_pdf_text(
     pdf: fitz.Document,
     file_hash: str,
 ) -> SourceDocument:
-    """沿用原 web_server.py 的文字版 PDF 优先分支，但不生成 DOCX。"""
+    """读取文字版 PDF，并按页面视觉坐标重建阅读顺序。
+
+    PDF 内部对象顺序并不一定等于页面上的阅读顺序。若直接遍历
+    ``page.get_text("dict")`` 返回的 block，视觉上位于“事实与理由”
+    之前的某一条诉讼请求，可能在对象流中排到该标题之后，进而造成
+    段落串栏。这里先收集整页文本行，再统一按 ``(y0, x0)`` 排序。
+    """
     lines: List[TextLine] = []
     text_parts: List[str] = []
 
     for page_index in range(pdf.page_count):
         page = pdf[page_index]
-        page_dict = page.get_text("dict")
+        try:
+            page_dict = page.get_text("dict", sort=True)
+        except TypeError:
+            # 兼容较旧的 PyMuPDF；后续仍会自行按 bbox 排序。
+            page_dict = page.get_text("dict")
+
+        page_lines: List[Tuple[float, float, int, str, Optional[List[float]]]] = []
+        sequence = 0
         for block in page_dict.get("blocks", []):
             if block.get("type") != 0:
                 continue
+            block_bbox = _bbox_to_list(block.get("bbox"))
             for line in block.get("lines", []):
                 spans = line.get("spans", [])
-                text = normalize_text("".join(str(span.get("text", "")) for span in spans))
-                if not text:
-                    continue
-                confidence = None
-                bbox = _bbox_to_list(line.get("bbox") or block.get("bbox"))
-                lines.append(
-                    TextLine(
-                        text=text,
-                        page=page_index + 1,
-                        paragraph=len(lines),
-                        bbox=bbox,
-                        confidence=confidence,
-                        block_type="pdf_text",
-                    )
+                line_text = normalize_text(
+                    "".join(str(span.get("text", "")) for span in spans)
                 )
-                text_parts.append(text)
+                if not line_text:
+                    continue
+                bbox = _bbox_to_list(line.get("bbox")) or block_bbox
+                if bbox:
+                    x0, y0 = float(bbox[0]), float(bbox[1])
+                else:
+                    # 没有坐标时保持原始相对次序，并排在有坐标文本之后。
+                    x0, y0 = float(sequence), float("inf")
+                page_lines.append((y0, x0, sequence, line_text, bbox))
+                sequence += 1
+
+        page_lines.sort(key=lambda item: (item[0], item[1], item[2]))
+        for _, _, _, line_text, bbox in page_lines:
+            lines.append(
+                TextLine(
+                    text=line_text,
+                    page=page_index + 1,
+                    paragraph=len(lines),
+                    bbox=bbox,
+                    confidence=None,
+                    block_type="pdf_text",
+                )
+            )
+            text_parts.append(line_text)
 
     return SourceDocument(
         filename=filename,
         extension=extension,
         text="\n".join(text_parts).strip(),
         lines=lines,
-        extraction_method="pdf_text_memory",
+        extraction_method="pdf_text_memory_visual_order",
         page_count=pdf.page_count,
         sha256=file_hash,
     )
