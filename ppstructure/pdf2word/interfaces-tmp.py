@@ -1,514 +1,656 @@
-import io
+"""Legal-document OCR extraction API.
+
+Drop-in replacement for the experimental ``interfaces-tmp.py`` entry point.
+It keeps OCR/layout recognition inside the existing pdf2word project, while
+exposing a stable, evidence-aware JSON contract for an external frontend.
+
+Run:
+    python interfaces-tmp.py
+
+Primary endpoints:
+    GET  /api/v1/health
+    GET  /api/v1/schemas
+    POST /api/v1/ocr/extract       multipart/form-data, field name: files
+    POST /api/v1/ocr/extract-text  application/json (development/testing)
+
+The API deliberately separates:
+- document classification and trial-stage inference;
+- raw OCR values and normalized values;
+- safe auto-fill fields and fields requiring human review;
+- document-derived fields and system/manual fields.
+"""
+
+from __future__ import annotations
+
+import hashlib
 import json
+import logging
 import os
-import re
-import traceback
+import tempfile
+import threading
 import uuid
-from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import fitz
-from flask import Flask, jsonify, request, send_from_directory
+import fitz  # PyMuPDF
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 修复：exported_frontend 只写一次
-FRONTEND_DIR = os.path.join(BASE_DIR, "exported_frontend")  
-DEFAULT_INPUT_DIR = os.path.join(BASE_DIR, "OCR识别文书")
-UPLOAD_DIR = os.path.join(BASE_DIR, "autofill_uploads")
-OUTPUT_DIR = os.path.join(BASE_DIR, "autofill_output")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+try:
+    from .legal_ocr_core import SourceDocument, TextLine, api_schema, extract_legal_document
+except ImportError:  # Direct script execution from this directory.
+    from legal_ocr_core import SourceDocument, TextLine, api_schema, extract_legal_document
 
-# 前端 tab 文件夹映射
-TAB_FOLDERS = {
-    "民事起诉状": "001_民事起诉状",
-    "传票": "002_传票",
-    "举证通知书": "003_举证通知书",
-    "管辖权异议": "004_管辖权异议",
-    "证据 - 财产保全": "005_证据_-_财产保全",
-    "答辩状": "006_答辩状",
-    "民事上诉状": "007_民事上诉状",
-    "案件判决": "008_案件判决",
-    "执行": "009_执行",
-    "原始附件": "010_原始附件",
-}
 
-# 文件名关键词 -> tab 映射
-FILENAME_TAB_RULES = [
-    ("民事起诉状", ["起诉状", "起诉"]),
-    ("传票", ["传票", "开庭传票"]),
-    ("举证通知书", ["举证通知书", "举证"]),
-    ("管辖权异议", ["管辖权异议", "异议申请"]),
-    ("证据 - 财产保全", ["财产保全", "证据保全", "保全申请"]),
-    ("答辩状", ["答辩状", "答辩"]),
-    ("民事上诉状", ["上诉状", "上诉"]),
-    ("案件判决", ["判决书", "判决", "裁定书", "裁定"]),
-    ("执行", ["执行", "执行申请"]),
+LOGGER = logging.getLogger("legal_ocr_api")
+logging.basicConfig(
+    level=os.getenv("OCR_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+APP_HOST = os.getenv("OCR_API_HOST", "0.0.0.0")
+APP_PORT = env_int("OCR_API_PORT", 8005)
+MAX_CONTENT_MB = env_int("OCR_MAX_CONTENT_MB", 80)
+MAX_FILES = env_int("OCR_MAX_FILES", 12)
+PDF_TEXT_PAGE_MIN_CHARS = env_int("OCR_PDF_TEXT_PAGE_MIN_CHARS", 60)
+PDF_RENDER_DPI = env_int("OCR_PDF_RENDER_DPI", 180)
+API_KEY = os.getenv("OCR_API_KEY", "").strip()
+ALLOWED_ORIGINS = [
+    item.strip()
+    for item in os.getenv("OCR_CORS_ORIGINS", "*").split(",")
+    if item.strip()
 ]
 
-SUPPORTED_EXTS = {"pdf", "docx", "jpg", "jpeg", "png", "bmp", "tif", "tiff"}
+ALLOWED_EXTENSIONS = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".docx",
+}
 
 app = Flask(__name__)
-CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_MB * 1024 * 1024
+app.json.ensure_ascii = False
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
-# ====== 直接导入 web_server-test.py 的资源（不用动态加载）======
-import sys
-sys.path.insert(0, BASE_DIR)
-try:
-    from ppstructure.predict_system import StructureSystem
-    from ppstructure.utility import parse_args
-    from ppstructure.recovery.recovery_to_doc import sorted_layout_boxes
+
+# ---------------------------------------------------------------------------
+# OCR engine: lazy, process-local and lock-protected
+# ---------------------------------------------------------------------------
+
+
+class OCREngine:
+    """Lazy PP-Structure wrapper.
+
+    Paddle inference objects are expensive and not guaranteed to be safe for
+    concurrent calls. A lock prevents multiple Flask request threads from
+    using the same engine at the same time.
+    """
+
+    def __init__(self) -> None:
+        self._engine: Any = None
+        self._load_error: Optional[str] = None
+        self._lock = threading.RLock()
+
+    @property
+    def loaded(self) -> bool:
+        return self._engine is not None
+
+    @property
+    def load_error(self) -> Optional[str]:
+        return self._load_error
+
+    def _build_kwargs(self) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "show_log": env_bool("OCR_SHOW_LOG", False),
+            "lang": os.getenv("OCR_LANG", "ch"),
+            "layout": env_bool("OCR_ENABLE_LAYOUT", True),
+            "table": env_bool("OCR_ENABLE_TABLE", True),
+            "ocr": True,
+            "use_gpu": env_bool("OCR_USE_GPU", True),
+        }
+        model_envs = {
+            "layout_model_dir": "OCR_LAYOUT_MODEL_DIR",
+            "table_model_dir": "OCR_TABLE_MODEL_DIR",
+            "det_model_dir": "OCR_DET_MODEL_DIR",
+            "rec_model_dir": "OCR_REC_MODEL_DIR",
+            "cls_model_dir": "OCR_CLS_MODEL_DIR",
+        }
+        for argument, env_name in model_envs.items():
+            value = os.getenv(env_name, "").strip()
+            if value:
+                kwargs[argument] = value
+        if os.getenv("OCR_GPU_MEM"):
+            kwargs["gpu_mem"] = env_int("OCR_GPU_MEM", 4000)
+        return kwargs
+
+    def ensure_loaded(self) -> Any:
+        if self._engine is not None:
+            return self._engine
+        if self._load_error:
+            raise RuntimeError(self._load_error)
+        with self._lock:
+            if self._engine is not None:
+                return self._engine
+            try:
+                from paddleocr import PPStructure
+
+                kwargs = self._build_kwargs()
+                LOGGER.info("Loading PPStructure with configured models")
+                self._engine = PPStructure(**kwargs)
+                LOGGER.info("PPStructure loaded")
+                return self._engine
+            except Exception as exc:  # pragma: no cover - depends on runtime models.
+                self._load_error = f"PPStructure initialization failed: {exc}"
+                LOGGER.exception(self._load_error)
+                raise RuntimeError(self._load_error) from exc
+
+    def recognize(self, image: Any, page: int) -> List[TextLine]:
+        engine = self.ensure_loaded()
+        with self._lock:
+            result = engine(image)
+        return parse_ppstructure_result(result, page=page)
+
+
+OCR_ENGINE = OCREngine()
+
+
+# ---------------------------------------------------------------------------
+# Source decoding
+# ---------------------------------------------------------------------------
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalize_line_text(text: Any) -> str:
+    return " ".join(str(text or "").replace("\u3000", " ").split()).strip()
+
+
+def redact_red_seal(image: Any) -> Any:
+    """Lightweight optional red-seal suppression before OCR.
+
+    This only whitens strongly red pixels. The original file is never changed,
+    and the option is off by default because red text may occasionally be
+    meaningful evidence.
+    """
+    try:
+        import cv2
+        import numpy as np
+
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        low1 = cv2.inRange(hsv, np.array([0, 70, 45]), np.array([12, 255, 255]))
+        low2 = cv2.inRange(hsv, np.array([165, 70, 45]), np.array([180, 255, 255]))
+        mask = cv2.bitwise_or(low1, low2)
+        output = image.copy()
+        output[mask > 0] = 255
+        return output
+    except Exception:
+        LOGGER.warning("Red-seal suppression failed; continuing with original image", exc_info=True)
+        return image
+
+
+def _bbox_from_region(region: Dict[str, Any]) -> Optional[List[float]]:
+    bbox = region.get("bbox") or region.get("box")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        try:
+            return [float(item) for item in bbox]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _text_from_nested(value: Any) -> List[Tuple[str, Optional[float], Optional[List[float]]]]:
+    """Collect text from the heterogeneous output shapes used by PPStructure."""
+    collected: List[Tuple[str, Optional[float], Optional[List[float]]]] = []
+    if value is None:
+        return collected
+    if isinstance(value, str):
+        text = normalize_line_text(value)
+        if text and not text.lstrip().startswith("<table"):
+            collected.append((text, None, None))
+        return collected
+    if isinstance(value, dict):
+        direct = value.get("text") or value.get("transcription")
+        if isinstance(direct, str):
+            confidence = value.get("confidence", value.get("score"))
+            try:
+                confidence = float(confidence) if confidence is not None else None
+            except (TypeError, ValueError):
+                confidence = None
+            bbox = value.get("text_region") or value.get("bbox") or value.get("box")
+            bbox_value: Optional[List[float]] = None
+            if isinstance(bbox, (list, tuple)):
+                # A quadrilateral is converted to its enclosing rectangle.
+                try:
+                    if len(bbox) == 4 and all(isinstance(x, (int, float)) for x in bbox):
+                        bbox_value = [float(x) for x in bbox]
+                    elif len(bbox) >= 4 and all(isinstance(x, (list, tuple)) for x in bbox):
+                        xs = [float(point[0]) for point in bbox]
+                        ys = [float(point[1]) for point in bbox]
+                        bbox_value = [min(xs), min(ys), max(xs), max(ys)]
+                except (TypeError, ValueError, IndexError):
+                    bbox_value = None
+            text = normalize_line_text(direct)
+            if text:
+                collected.append((text, confidence, bbox_value))
+        for key, nested in value.items():
+            if key in {"text", "transcription", "confidence", "score", "text_region", "bbox", "box", "html"}:
+                continue
+            collected.extend(_text_from_nested(nested))
+        return collected
+    if isinstance(value, (list, tuple)):
+        # PaddleOCR classic tuple: [quad, (text, score)]
+        if (
+            len(value) == 2
+            and isinstance(value[1], (list, tuple))
+            and len(value[1]) >= 1
+            and isinstance(value[1][0], str)
+        ):
+            text = normalize_line_text(value[1][0])
+            confidence = None
+            if len(value[1]) > 1:
+                try:
+                    confidence = float(value[1][1])
+                except (TypeError, ValueError):
+                    confidence = None
+            if text:
+                collected.append((text, confidence, None))
+            return collected
+        for item in value:
+            collected.extend(_text_from_nested(item))
+    return collected
+
+
+def parse_ppstructure_result(result: Any, page: int) -> List[TextLine]:
+    lines: List[TextLine] = []
+    regions: Sequence[Any] = result if isinstance(result, (list, tuple)) else [result]
+    for region in regions:
+        if not isinstance(region, dict):
+            for text, confidence, bbox in _text_from_nested(region):
+                lines.append(TextLine(text=text, page=page, bbox=bbox, confidence=confidence, block_type="ocr"))
+            continue
+        block_type = str(region.get("type") or "ocr")
+        region_bbox = _bbox_from_region(region)
+        payload = region.get("res", region)
+        nested = _text_from_nested(payload)
+        for text, confidence, text_bbox in nested:
+            lines.append(
+                TextLine(
+                    text=text,
+                    page=page,
+                    bbox=text_bbox or region_bbox,
+                    confidence=confidence,
+                    block_type=block_type,
+                )
+            )
+    # PPStructure may return repeated text through nested dicts. Preserve order.
+    deduplicated: List[TextLine] = []
+    seen: set[Tuple[int, str, str]] = set()
+    for line in lines:
+        marker = (page, line.block_type or "", line.text)
+        if marker not in seen:
+            seen.add(marker)
+            deduplicated.append(line)
+    return deduplicated
+
+
+def _pixmap_to_bgr(page: fitz.Page, dpi: int) -> Any:
     import cv2
     import numpy as np
-    import copy
-    import threading
-    
-    def redink_remover(img):
-        image = copy.deepcopy(img)
-        blue_c, green_c, red_c = cv2.split(image)
-        result_img = np.expand_dims(red_c, axis=2)
-        result_img = np.concatenate((result_img, result_img, result_img), axis=-1)
-        return result_img
-    
-    # 初始化 OCR 引擎（只初始化一次）
-    def init_ocr_engine():
-        root = os.path.abspath(os.path.join(BASE_DIR, '../../'))
-        args = parse_args()
-        args.use_gpu = True
-        args.table_max_len = 488
-        args.ocr = True
-        args.recovery = True
-        args.layout_model_dir = r'/data/tensorflow/kath/OCR/models/pdf2word/layout/429/best_model/infer/picodet_2026_pdf2word'
-        args.det_model_dir = os.path.join(root, "inference", "cn_PP-OCRv3_det_infer")
-        args.rec_model_dir = os.path.join(root, "inference", "cn_PP-OCRv3_rec_infer")
-        args.table_model_dir = os.path.join(root, "inference", "table_new")
-        args.rec_char_dict_path = os.path.join(root, "ppocr", "utils", "ppocr_keys_v1.txt")
-        args.layout_dict_path = os.path.join(root, "ppocr", "utils", "dict", "layout_dict", "pdf2word_dict.txt")
-        args.layout_score_threshold = 0.6
-        args.table_char_dict_path = os.path.join(root, "ppocr", "utils", "dict", "table_structure_dict_ch.txt")
-        return StructureSystem(args), threading.Lock()
-    
-    predictor, ocr_lock = init_ocr_engine()
-    OCR_AVAILABLE = True
-except Exception as e:
-    print(f"OCR engine initialization failed: {e}")
-    predictor = None
-    ocr_lock = None
-    OCR_AVAILABLE = False
+
+    pix = page.get_pixmap(dpi=dpi, alpha=False)
+    array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:
+        return cv2.cvtColor(array, cv2.COLOR_RGBA2BGR)
+    return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
 
 
-def _normalize_for_match(text):
-    text = str(text or "").strip().lower()
-    text = re.sub(r"[\s\u3000]+", "", text)
-    text = re.sub(r"[：:，,。；;（）()\[\]【】""\"'\-_/]", "", text)
-    return text
+def _pdf_text_lines(page: fitz.Page, page_number: int) -> List[TextLine]:
+    lines: List[TextLine] = []
+    try:
+        page_dict = page.get_text("dict")
+        for block in page_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                text = normalize_line_text("".join(str(span.get("text") or "") for span in spans))
+                if not text:
+                    continue
+                bbox = line.get("bbox") or block.get("bbox")
+                bbox_value = [float(item) for item in bbox] if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None
+                lines.append(TextLine(text=text, page=page_number, bbox=bbox_value, block_type="pdf_text"))
+    except Exception:
+        LOGGER.warning("Structured PDF text extraction failed; falling back to plain text", exc_info=True)
+    if not lines:
+        for text_line in (page.get_text("text") or "").splitlines():
+            text = normalize_line_text(text_line)
+            if text:
+                lines.append(TextLine(text=text, page=page_number, block_type="pdf_text"))
+    return lines
 
 
-def _guess_tab_by_filename(filename):
-    name = str(filename or "")
-    for tab, keywords in FILENAME_TAB_RULES:
-        if any(k in name for k in keywords):
-            return tab
-    return "原始附件"
+def source_from_pdf(path: Path, original_name: str, remove_seal: bool) -> SourceDocument:
+    document = fitz.open(path)
+    all_lines: List[TextLine] = []
+    methods: List[str] = []
+    warnings: List[str] = []
+    try:
+        for page_index in range(document.page_count):
+            page = document.load_page(page_index)
+            raw_text = page.get_text("text") or ""
+            normalized_chars = len("".join(raw_text.split()))
+            if normalized_chars >= PDF_TEXT_PAGE_MIN_CHARS:
+                methods.append("pdf_text")
+                all_lines.extend(_pdf_text_lines(page, page_index + 1))
+            else:
+                methods.append("ocr")
+                image = _pixmap_to_bgr(page, PDF_RENDER_DPI)
+                if remove_seal:
+                    image = redact_red_seal(image)
+                recognized = OCR_ENGINE.recognize(image, page=page_index + 1)
+                if recognized:
+                    all_lines.extend(recognized)
+                elif raw_text.strip():
+                    # Never throw away a weak but nonempty text layer.
+                    warnings.append(f"第 {page_index + 1} 页 OCR 无结果，回退到稀疏 PDF 文本层。")
+                    for line in raw_text.splitlines():
+                        text = normalize_line_text(line)
+                        if text:
+                            all_lines.append(TextLine(text=text, page=page_index + 1, block_type="pdf_text_fallback"))
+        method_set = set(methods)
+        if method_set == {"pdf_text"}:
+            method = "pdf_text"
+        elif method_set == {"ocr"}:
+            method = "pdf_ocr"
+        else:
+            method = "pdf_hybrid"
+        return SourceDocument(
+            filename=original_name,
+            extension=path.suffix.lower(),
+            text="\n".join(line.text for line in all_lines),
+            lines=all_lines,
+            extraction_method=method,
+            page_count=document.page_count,
+            sha256=sha256_file(path),
+            warnings=warnings,
+        )
+    finally:
+        document.close()
 
 
-def _extract_labels_from_html(html):
-    labels = re.findall(r'n-form-item-label__text">([^<]{1,80})<', html)
-    sections = re.findall(r'>(诉讼请求|事实与理由|答辩意见|判决信息|案件分析|备注|执行进度|证据信息)<', html)
-    labels.extend(sections)
-    
-    result = []
-    seen = set()
-    for item in labels:
-        item = re.sub(r"\s+", "", item)
-        if item and item not in seen:
-            seen.add(item)
-            result.append(item)
+def source_from_image(path: Path, original_name: str, remove_seal: bool) -> SourceDocument:
+    import cv2
+    import numpy as np
+
+    data = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("无法解码图片")
+    if remove_seal:
+        image = redact_red_seal(image)
+    lines = OCR_ENGINE.recognize(image, page=1)
+    return SourceDocument(
+        filename=original_name,
+        extension=path.suffix.lower(),
+        text="\n".join(line.text for line in lines),
+        lines=lines,
+        extraction_method="image_ocr",
+        page_count=1,
+        sha256=sha256_file(path),
+    )
+
+
+def source_from_docx(path: Path, original_name: str) -> SourceDocument:
+    from docx import Document
+
+    document = Document(path)
+    lines: List[TextLine] = []
+    paragraph_index = 0
+    for paragraph in document.paragraphs:
+        paragraph_index += 1
+        text = normalize_line_text(paragraph.text)
+        if text:
+            lines.append(TextLine(text=text, paragraph=paragraph_index, block_type="paragraph"))
+    for table_index, table in enumerate(document.tables, start=1):
+        for row_index, row in enumerate(table.rows, start=1):
+            cell_texts = [normalize_line_text(cell.text) for cell in row.cells]
+            cell_texts = [text for text in cell_texts if text]
+            if cell_texts:
+                lines.append(
+                    TextLine(
+                        text=" | ".join(cell_texts),
+                        paragraph=paragraph_index + table_index,
+                        block_type=f"table_row_{row_index}",
+                    )
+                )
+    return SourceDocument(
+        filename=original_name,
+        extension=path.suffix.lower(),
+        text="\n".join(line.text for line in lines),
+        lines=lines,
+        extraction_method="docx_text",
+        page_count=None,
+        sha256=sha256_file(path),
+    )
+
+
+def load_source(path: Path, original_name: str, remove_seal: bool = False) -> SourceDocument:
+    extension = path.suffix.lower()
+    if extension == ".pdf":
+        return source_from_pdf(path, original_name, remove_seal)
+    if extension == ".docx":
+        return source_from_docx(path, original_name)
+    if extension in ALLOWED_EXTENSIONS:
+        return source_from_image(path, original_name, remove_seal)
+    raise ValueError(f"不支持的文件格式：{extension}")
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers and routes
+# ---------------------------------------------------------------------------
+
+
+def request_bool(name: str, default: bool = False) -> bool:
+    value = request.form.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def check_api_key() -> Optional[Tuple[Any, int]]:
+    if not API_KEY:
+        return None
+    supplied = request.headers.get("X-API-Key", "")
+    if supplied != API_KEY:
+        return jsonify({"success": False, "error": {"code": "UNAUTHORIZED", "message": "无效的 API Key"}}), 401
+    return None
+
+
+def error_response(code: str, message: str, status: int, request_id: Optional[str] = None) -> Tuple[Any, int]:
+    payload: Dict[str, Any] = {"success": False, "error": {"code": code, "message": message}}
+    if request_id:
+        payload["request_id"] = request_id
+    return jsonify(payload), status
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_too_large(_: RequestEntityTooLarge) -> Tuple[Any, int]:
+    return error_response("PAYLOAD_TOO_LARGE", f"请求体超过 {MAX_CONTENT_MB} MB 限制", 413)
+
+
+@app.get("/api/v1/health")
+def health() -> Tuple[Any, int]:
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
+    return jsonify(
+        {
+            "success": True,
+            "service": "legal-document-ocr",
+            "version": "1.0.0",
+            "ocr_engine": {
+                "loaded": OCR_ENGINE.loaded,
+                "load_error": OCR_ENGINE.load_error,
+                "use_gpu": env_bool("OCR_USE_GPU", True),
+            },
+            "limits": {"max_content_mb": MAX_CONTENT_MB, "max_files": MAX_FILES},
+        }
+    ), 200
+
+
+@app.get("/api/v1/schemas")
+def schemas() -> Tuple[Any, int]:
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
+    return jsonify({"success": True, "schema": api_schema()}), 200
+
+
+def _extract_one(path: Path, original_name: str, hint: Optional[str], remove_seal: bool, include_raw_text: bool) -> Dict[str, Any]:
+    source = load_source(path, original_name, remove_seal=remove_seal)
+    result = extract_legal_document(source, document_type_hint=hint)
+    if include_raw_text:
+        result["raw_text"] = source.text
     return result
 
 
-def _load_frontend_label_map():
-    """加载前端各 tab 的字段标签"""
-    tab_label_map = {}
-    for tab_name, folder in TAB_FOLDERS.items():
-        page_path = os.path.join(FRONTEND_DIR, folder, "page.html")
-        if not os.path.exists(page_path):
-            print(f"Warning: Frontend page not found: {page_path}")
-            tab_label_map[tab_name] = []
-            continue
-        try:
-            with open(page_path, "r", encoding="utf-8", errors="ignore") as f:
-                html = f.read()
-            labels = _extract_labels_from_html(html)
-            tab_label_map[tab_name] = labels
-            print(f"Loaded {len(labels)} labels for {tab_name}")
-        except Exception as e:
-            print(f"Error loading labels for {tab_name}: {e}")
-            tab_label_map[tab_name] = []
-    return tab_label_map
+def _extract_uploaded_files() -> Tuple[Any, int]:
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
 
+    request_id = str(uuid.uuid4())
+    uploaded = request.files.getlist("files") or request.files.getlist("file")
+    if not uploaded:
+        return error_response("NO_FILES", "请使用 multipart/form-data 上传 files 字段", 400, request_id)
+    if len(uploaded) > MAX_FILES:
+        return error_response("TOO_MANY_FILES", f"单次最多上传 {MAX_FILES} 个文件", 400, request_id)
 
-FRONTEND_LABELS = _load_frontend_label_map()
+    hint = (request.form.get("document_type") or "").strip() or None
+    remove_seal = request_bool("remove_red_seal", False)
+    include_raw_text = request_bool("include_raw_text", False)
+    documents: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
 
-
-def _extract_text_from_pdf(file_path):
-    """从 PDF 提取全文本"""
-    try:
-        with fitz.open(file_path) as pdf:
-            texts = [pdf[pg].get_text("text") or "" for pg in range(pdf.page_count)]
-            return "\n".join(texts)
-    except Exception as e:
-        print(f"PDF text extraction error: {e}")
-        return ""
-
-
-def _extract_via_ocr(file_path, ext, remove_red_seal=False):
-    """走 OCR 提取（需要 predictor 和 ocr_lock）"""
-    if not OCR_AVAILABLE:
-        return {}, ""
-    
-    imgs = []
-    try:
-        if ext == "pdf":
-            with fitz.open(file_path) as pdf:
-                for pg in range(pdf.page_count):
-                    pix = pdf[pg].get_pixmap(matrix=fitz.Matrix(2, 2))
-                    img_np = np.frombuffer(pix.tobytes(), np.uint8)
-                    img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
-                    if img is not None:
-                        if remove_red_seal:
-                            img = redink_remover(img)
-                        imgs.append(img)
-        else:
-            img = cv2.imread(file_path)
-            if img is not None:
-                if remove_red_seal:
-                    img = redink_remover(img)
-                imgs.append(img)
-    except Exception as e:
-        print(f"Image loading error: {e}")
-        return {}, ""
-    
-    if not imgs:
-        return {}, ""
-    
-    record = {}
-    all_text = []
-    
-    with ocr_lock:
-        for img in imgs:
+    with tempfile.TemporaryDirectory(prefix="legal_ocr_") as temp_dir:
+        temp_root = Path(temp_dir)
+        for index, storage in enumerate(uploaded):
+            original_name = storage.filename or f"upload_{index + 1}"
+            extension = Path(original_name).suffix.lower()
+            if extension not in ALLOWED_EXTENSIONS:
+                errors.append(
+                    {
+                        "filename": original_name,
+                        "code": "UNSUPPORTED_FILE_TYPE",
+                        "message": f"不支持的文件格式：{extension or '无扩展名'}",
+                    }
+                )
+                continue
+            safe_stem = secure_filename(Path(original_name).stem) or f"upload_{index + 1}"
+            temp_path = temp_root / f"{uuid.uuid4().hex}_{safe_stem}{extension}"
+            storage.save(temp_path)
             try:
-                res, _ = predictor(img)
-                h, w, _ = img.shape
-                res_sorted = sorted_layout_boxes(res, w)
-                
-                for region in res_sorted:
-                    # 提取文本
-                    if region.get("type", "").lower() == "text":
-                        if isinstance(region.get("res"), list):
-                            for item in region["res"]:
-                                if isinstance(item, dict) and "text" in item:
-                                    all_text.append(item["text"])
-                    
-                    # 提取表格键值对
-                    if region.get("type", "").lower() == "table":
-                        r = region.get("res")
-                        if isinstance(r, dict) and r.get("html"):
-                            try:
-                                import pandas as pd
-                                dfs = pd.read_html(io.StringIO(r["html"]), header=None)
-                                if dfs:
-                                    tbl_df = dfs[0]
-                                    for _, row_s in tbl_df.iterrows():
-                                        vals = ['' if str(v) == 'nan' else str(v).strip() for v in row_s]
-                                        i = 0
-                                        while i + 1 < len(vals):
-                                            k, v = vals[i], vals[i + 1]
-                                            if k:
-                                                k_clean = k.strip().rstrip('：:')
-                                                if k_clean:
-                                                    record[k_clean] = v
-                                            i += 2
-                            except Exception as e:
-                                print(f"Table parsing error: {e}")
-            except Exception as e:
-                print(f"OCR page error: {e}")
-    
-    full_text = "\n".join(all_text)
-    return record, full_text
-
-
-def _parse_key_values_from_text(text):
-    """从纯文本中正则提取关键字段"""
-    result = {}
-    
-    m = re.search(r"([\u4e00-\u9fa5]{2,40}人民法院)", text)
-    if m:
-        result["受理法院"] = m.group(1)
-    
-    m = re.search(r"([（(]\d{4}[）)][^\n]{2,40}?号)", text)
-    if m:
-        result["案件编号"] = m.group(1)
-    
-    m = re.search(r"原告[人]?[：:\s]*([\u4e00-\u9fa5A-Za-z·]{2,30})", text)
-    if m:
-        result["原告"] = m.group(1)
-    
-    m = re.search(r"被告[人]?[：:\s]*([\u4e00-\u9fa5A-Za-z·]{2,40})", text)
-    if m:
-        result["被告"] = m.group(1)
-    
-    m = re.search(r"(?:诉讼标的额|标的额|诉讼金额)[：:\s]*([0-9,.]{1,20})", text)
-    if m:
-        result["诉讼标的额"] = m.group(1)
-    
-    m = re.search(r"判决如下：:", text, re.S)
-    if m:
-        result["判决结果"] = re.sub(r"\s+", "", m.group(1))[:200]
-    
-    return result
-
-
-def _best_label_match(record_key, labels):
-    """找到最匹配的前端标签"""
-    key_norm = _normalize_for_match(record_key)
-    if not key_norm:
-        return None, 0.0
-    
-    best_label = None
-    best_score = 0.0
-    for label in labels:
-        label_norm = _normalize_for_match(label)
-        if not label_norm:
-            continue
-        
-        if key_norm == label_norm:
-            return label, 1.0
-        if key_norm in label_norm or label_norm in key_norm:
-            score = 0.92
-        else:
-            score = SequenceMatcher(None, key_norm, label_norm).ratio()
-        
-        if score > best_score:
-            best_score = score
-            best_label = label
-    
-    return best_label, best_score
-
-
-def _map_record_to_frontend(tab_name, record):
-    """将提取的字段映射到前端标签"""
-    labels = FRONTEND_LABELS.get(tab_name, [])
-    mapped = {}
-    unmatched = {}
-    
-    for k, v in record.items():
-        if k == "文件名":
-            continue
-        value = str(v or "").strip()
-        if not value:
-            continue
-        
-        label, score = _best_label_match(k, labels)
-        if label and score >= 0.68:
-            if label not in mapped or len(value) > len(mapped[label]):
-                mapped[label] = value
-        else:
-            unmatched[k] = value
-    
-    return mapped, unmatched
-
-
-def _process_single_file(file_path, filename, remove_red_seal=False):
-    """处理单个文件，返回按文档名组织的结果"""
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in SUPPORTED_EXTS:
-        return {
-            filename: {
-                "错误": f"不支持的文件类型: {ext}"
-            }
-        }
-    
-    tab_name = _guess_tab_by_filename(filename)
-    
-    # 1. 先尝试纯文本提取（PDF 文字层）
-    text = ""
-    record = {}
-    if ext == "pdf":
-        text = _extract_text_from_pdf(file_path)
-        if text.strip():
-            record = _parse_key_values_from_text(text)
-    
-    # 2. 如果纯文本提取不够，走 OCR
-    if not record and OCR_AVAILABLE:
-        ocr_record, ocr_text = _extract_via_ocr(file_path, ext, remove_red_seal)
-        record.update(ocr_record)
-        if ocr_text:
-            text_kv = _parse_key_values_from_text(ocr_text)
-            for k, v in text_kv.items():
-                if k not in record:
-                    record[k] = v
-    
-    # 3. 映射到前端字段
-    mapped, unmatched = _map_record_to_frontend(tab_name, record)
-    
-    # 4. 按文档名组织输出
-    return {
-        filename: {
-            "文书类型": tab_name,
-            "前端字段": mapped,
-            "未匹配字段": unmatched,
-            "提取方式": "OCR" if OCR_AVAILABLE else "文本",
-            "原始记录条目数": len(record)
-        }
-    }
-
-
-def _save_batch_json(task_id, payload):
-    out_name = f"{task_id}_autofill.json"
-    out_path = os.path.join(OUTPUT_DIR, out_name)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return out_name
-
-
-@app.route("/")
-def root():
-    return jsonify({
-        "service": "pdf2word-autofill",
-        "ocr_available": OCR_AVAILABLE,
-        "frontend_tabs_loaded": len(FRONTEND_LABELS),
-        "endpoints": [
-            "POST /autofill_from_folder",
-            "POST /autofill_from_uploads",
-            "GET /download/<filename>",
-        ],
-    })
-
-
-@app.route("/download/<filename>")
-def download(filename):
-    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
-
-
-@app.route("/autofill_from_folder", methods=["POST"])
-def autofill_from_folder():
-    body = request.get_json(silent=True) or {}
-    input_path = request.args.get("input_folder") or body.get("input_folder", DEFAULT_INPUT_DIR)
-    remove_red_seal = request.args.get("remove_red_seal", "").lower() == "true" or bool(body.get("remove_red_seal", False))
-    
-    input_path = input_path.strip('"').strip("'").strip()
-    task_id = str(uuid.uuid4())[:8]
-    all_results = {}
-    
-    try:
-        if os.path.isfile(input_path):
-            filename = os.path.basename(input_path)
-            if "." in filename:
-                file_result = _process_single_file(input_path, filename, remove_red_seal)
-                all_results.update(file_result)
-        
-        elif os.path.isdir(input_path):
-            for filename in sorted(os.listdir(input_path)):
-                file_path = os.path.join(input_path, filename)
-                if not os.path.isfile(file_path):
-                    continue
-                if "." not in filename:
-                    continue
-                ext = filename.rsplit(".", 1)[-1].lower()
-                if ext not in SUPPORTED_EXTS:
-                    continue
-                
-                try:
-                    file_result = _process_single_file(file_path, filename, remove_red_seal)
-                    all_results.update(file_result)
-                except Exception as exc:
-                    all_results[filename] = {"错误": str(exc)}
-        else:
-            return jsonify({"error": f"路径不存在: {input_path}"}), 400
-        
-        payload = {
-            "task_id": task_id,
-            "source": "folder" if os.path.isdir(input_path) else "single_file",
-            "input_path": input_path,
-            "total": len(all_results),
-            "results": all_results
-        }
-        
-        out_name = _save_batch_json(task_id, payload)
-        return jsonify({
-            "task_id": task_id,
-            "total": len(all_results),
-            "download_url": f"/download/{out_name}",
-            "saved_file": out_name,
-            "results": all_results
-        })
-    
-    except Exception as exc:
-        return jsonify({"error": str(exc), "traceback": traceback.format_exc()}), 500
-
-
-@app.route("/autofill_from_uploads", methods=["POST"])
-def autofill_from_uploads():
-    uploaded_files = request.files.getlist("files")
-    remove_red_seal = request.form.get("remove_red_seal", "false").lower() == "true"
-    
-    if not uploaded_files:
-        return jsonify({"error": "No files uploaded"}), 400
-    
-    task_id = str(uuid.uuid4())[:8]
-    batch_dir = os.path.join(UPLOAD_DIR, task_id)
-    os.makedirs(batch_dir, exist_ok=True)
-    
-    all_results = {}
-    
-    try:
-        for file in uploaded_files:
-            if not file or not file.filename:
-                continue
-            filename = file.filename
-            if "." not in filename:
-                continue
-            
-            ext = filename.rsplit(".", 1)[-1].lower()
-            if ext not in SUPPORTED_EXTS:
-                all_results[filename] = {"错误": f"不支持的文件类型: {ext}"}
-                continue
-            
-            safe_name = filename.replace("/", "_").replace("\\", "_")
-            saved_path = os.path.join(batch_dir, safe_name)
-            file.save(saved_path)
-            
-            try:
-                file_result = _process_single_file(saved_path, safe_name, remove_red_seal)
-                all_results.update(file_result)
+                documents.append(_extract_one(temp_path, original_name, hint, remove_seal, include_raw_text))
             except Exception as exc:
-                all_results[safe_name] = {"错误": str(exc)}
-        
-        payload = {
-            "task_id": task_id,
-            "source": "upload",
-            "total": len(all_results),
-            "results": all_results
+                LOGGER.exception("Document extraction failed: %s", original_name)
+                errors.append(
+                    {
+                        "filename": original_name,
+                        "code": "EXTRACTION_FAILED",
+                        "message": str(exc),
+                    }
+                )
+
+    status = 200 if documents else 422
+    return jsonify(
+        {
+            "success": bool(documents),
+            "request_id": request_id,
+            "documents": documents,
+            "errors": errors,
+            "summary": {
+                "received": len(uploaded),
+                "succeeded": len(documents),
+                "failed": len(errors),
+            },
         }
-        
-        out_name = _save_batch_json(task_id, payload)
-        return jsonify({
-            "task_id": task_id,
-            "total": len(all_results),
-            "download_url": f"/download/{out_name}",
-            "saved_file": out_name,
-            "results": all_results
-        })
-    
-    except Exception as exc:
-        return jsonify({"error": str(exc), "traceback": traceback.format_exc()}), 500
+    ), status
+
+
+@app.post("/api/v1/ocr/extract")
+def extract_uploads() -> Tuple[Any, int]:
+    return _extract_uploaded_files()
+
+
+# Backward-compatible route for the former experimental frontend.
+@app.post("/autofill_from_uploads")
+def legacy_extract_uploads() -> Tuple[Any, int]:
+    return _extract_uploaded_files()
+
+
+@app.post("/api/v1/ocr/extract-text")
+def extract_text() -> Tuple[Any, int]:
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
+    payload = request.get_json(silent=True) or {}
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return error_response("EMPTY_TEXT", "text 不能为空", 400)
+    filename = str(payload.get("filename") or "inline.txt")
+    hint = payload.get("document_type")
+    lines = [TextLine(text=line, paragraph=index + 1, block_type="inline_text") for index, line in enumerate(text.splitlines()) if line.strip()]
+    source = SourceDocument(
+        filename=filename,
+        extension=".txt",
+        text=text,
+        lines=lines,
+        extraction_method="inline_text",
+        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    )
+    return jsonify({"success": True, "document": extract_legal_document(source, document_type_hint=hint)}), 200
+
+
+@app.get("/")
+def index() -> Tuple[Any, int]:
+    return jsonify(
+        {
+            "service": "legal-document-ocr",
+            "version": "1.0.0",
+            "endpoints": {
+                "health": "GET /api/v1/health",
+                "schemas": "GET /api/v1/schemas",
+                "extract": "POST /api/v1/ocr/extract",
+            },
+        }
+    ), 200
 
 
 if __name__ == "__main__":
-    print(f"Flask server starting at http://localhost:8006")
-    print(f"OCR Available: {OCR_AVAILABLE}")
-    print(f"Frontend tabs loaded: {len(FRONTEND_LABELS)}")
-    for tab, labels in FRONTEND_LABELS.items():
-        print(f"  {tab}: {len(labels)} 个字段")
-    app.run(host="0.0.0.0", port=8006, debug=False)
+    app.run(host=APP_HOST, port=APP_PORT, threaded=True)
