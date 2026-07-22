@@ -798,6 +798,37 @@ def choose_court(text: str, doc_type: str) -> Optional[str]:
     return courts[-1]
 
 
+def extract_preservation_receiving_court(text: str) -> Optional[str]:
+    """提取财产保全申请书所对应的受理法院。
+
+    财产保全文书中的法院名称常见于“受理法院：”“此致：”、
+    “向××法院申请财产保全”或“请求××法院采取保全措施”等位置。
+    该函数优先使用这些强语义位置，避免通用 ``choose_court`` 在正文
+    同时出现原审法院、担保机构或其他法院时误取最后一个法院名称。
+    """
+    normalized = normalize_text(text)
+    court_name = (
+        r"[\u4e00-\u9fff]{2,40}?"
+        r"(?:人民法院|海事法院|知识产权法院|互联网法院|金融法院|铁路运输法院)"
+    )
+
+    patterns = [
+        # 明确字段标签，兼容正文、表格恢复后的“|”分隔以及中英文冒号。
+        rf"(?:受理法院|管辖法院|申请法院|提交法院|收件法院)\s*(?:[:：|｜])?\s*({court_name})",
+        # 落款常见格式：此致：××人民法院，或“此致”与法院分成两行。
+        rf"此致\s*(?:[:：])?\s*(?:\n\s*)?({court_name})",
+        # 正文中的明确申请对象。
+        rf"(?:向|请求|恳请)\s*({court_name})\s*(?:申请|依法|采取|裁定|受理)",
+        rf"({court_name})\s*(?:提出|提交|受理)(?:诉前|诉讼)?财产保全(?:申请)?",
+    ]
+
+    value = first_match(patterns, normalized)
+    if value:
+        return value
+
+    # 回退到既有通用逻辑，保证不破坏原有可识别样本。
+    return choose_court(normalized, "preservation_application")
+
 def extract_cause(text: str) -> Optional[str]:
     for cause in CAUSE_DICTIONARY:
         if cause in text:
@@ -1635,6 +1666,7 @@ def extract_jurisdiction_objection(builder: ExtractionBuilder) -> None:
 
 def extract_preservation_application(builder: ExtractionBuilder) -> None:
     text = builder.source.text
+    receiving_court = extract_preservation_receiving_court(text)
     parties = builder.fields.get("parties")
     applicant = None
     respondent = None
@@ -1651,6 +1683,15 @@ def extract_preservation_application(builder: ExtractionBuilder) -> None:
     guarantee_type = classify_guarantee_type(guarantee or text)
     amount = request_amount_summary(target)
 
+    # 覆盖 common() 中可能缺失或误取的通用法院结果。
+    if receiving_court:
+        builder.add(
+            "court",
+            receiving_court,
+            confidence=0.97,
+            level="direct",
+            note="根据财产保全申请书中的受理法院标签、此致落款或明确申请对象提取。",
+        )
     if applicant:
         builder.add("applicant", applicant, confidence=0.9, level="conditional" if "脱敏" in applicant else "direct")
     if respondent:
