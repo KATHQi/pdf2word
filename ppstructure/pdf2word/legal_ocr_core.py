@@ -1644,7 +1644,7 @@ def extract_preservation_receiving_court(text: str) -> Optional[str]:
     compact = compact_text(text)
     return first_match(
         [
-            r"[【\[][^】\]]{0,240}?法院:("
+            r"[【\[][^】\]]{0,240}?法院[:：]("
             r"[\u4e00-\u9fff]{2,40}?(?:人民法院|海事法院|知识产权法院|互联网法院|金融法院|铁路运输法院)"
             r")(?=[｜|】\]])",
         ],
