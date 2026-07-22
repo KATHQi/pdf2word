@@ -1511,9 +1511,9 @@ def extract_jurisdiction_objection(builder: ExtractionBuilder) -> None:
     if parties:
         for party in parties.normalized_value:
             if party.get("role") == "申请人" and not applicant:
-                applicant = party.get("name")
+                applicant = party.get("current_role_detail")
             if party.get("role") == "被申请人" and not respondent:
-                respondent = party.get("name")
+                respondent = party.get("current_role_detail")
     request_text = extract_section(text, ["申请事项", "申请请求"], ["事实与理由", "事实和理由"])
     requested_court = first_match([
         r"移送\s*([\u4e00-\u9fff]{2,30}(?:高级|中级)?人民法院)\s*审理",
