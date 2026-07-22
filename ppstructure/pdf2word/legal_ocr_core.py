@@ -1133,18 +1133,102 @@ def classify_request_type(request_text: Optional[str]) -> List[str]:
 
 
 def classify_jurisdiction(text: str) -> Tuple[Optional[str], Optional[str]]:
-    error_type = None
-    objection_type = None
-    if "不动产" in text or "专属管辖" in text:
-        error_type = "不动产所在地/专属管辖"
-        objection_type = "专属管辖异议"
-    elif "合同履行地" in text:
-        error_type = "合同履行地管辖"
-        objection_type = "地域管辖异议"
-    elif "被告住所地" in text or "申请人住所地" in text:
-        error_type = "被告住所地管辖"
-        objection_type = "地域管辖异议"
-    return error_type, objection_type
+    """将管辖权异议归入前端允许的三个固定枚举。
+
+    判断优先级为：专属管辖错误 > 级别管辖错误 > 地域管辖错误。
+    优先级不能颠倒，因为专属管辖理由中也经常出现“所在地”等地域词。
+    没有足够依据时返回 ``(None, None)``，避免强行填充错误类别。
+    """
+    normalized_text = re.sub(r"\s+", "", text or "")
+    if not normalized_text:
+        return None, None
+
+    # 先识别文书中直接出现的标准枚举或异议类型。
+    explicit_rules = [
+        ("专属管辖错误", "专属管辖异议", ["专属管辖错误", "专属管辖异议"]),
+        ("级别管辖错误", "级别管辖异议", ["级别管辖错误", "级别管辖异议"]),
+        ("地域管辖错误", "地域管辖异议", ["地域管辖错误", "地域管辖异议"]),
+    ]
+    for error_type, objection_type, keywords in explicit_rules:
+        if any(keyword in normalized_text for keyword in keywords):
+            return error_type, objection_type
+
+    # 专属管辖具有排他性，必须优先于一般地域管辖判断。
+    exclusive_keywords = [
+        "专属管辖",
+        "不动产所在地人民法院管辖",
+        "不动产所在地法院管辖",
+        "不动产纠纷",
+        "港口所在地人民法院管辖",
+        "港口作业纠纷",
+        "遗产所在地人民法院管辖",
+        "主要遗产所在地人民法院管辖",
+        "继承遗产纠纷",
+    ]
+    if any(keyword in normalized_text for keyword in exclusive_keywords):
+        return "专属管辖错误", "专属管辖异议"
+
+    # 级别管辖需要出现明确的法院层级、受理范围或标的额依据；
+    # 仅出现“基层/中级/高级人民法院”的法院名称，不足以单独认定。
+    level_keywords = [
+        "级别管辖",
+        "管辖级别",
+        "越级管辖",
+        "超越级别管辖",
+        "不符合级别管辖",
+        "不属于基层人民法院管辖",
+        "不应由基层人民法院管辖",
+        "应由中级人民法院管辖",
+        "应由高级人民法院管辖",
+        "应由最高人民法院管辖",
+        "超过基层人民法院受理范围",
+        "超过中级人民法院受理范围",
+        "诉讼标的额超过",
+        "标的额超过",
+    ]
+    level_patterns = [
+        r"(?:本案|该案).{0,20}(?:应当|应由|依法应由)(?:中级|高级|最高)人民法院管辖",
+        r"(?:基层|中级)人民法院.{0,20}(?:无权|不具有|没有)(?:级别)?管辖权",
+        r"(?:诉讼)?标的额.{0,20}(?:超过|超出).{0,20}(?:受理|管辖)(?:范围|标准)",
+    ]
+    if any(keyword in normalized_text for keyword in level_keywords) or any(
+        re.search(pattern, normalized_text) for pattern in level_patterns
+    ):
+        return "级别管辖错误", "级别管辖异议"
+
+    # 其余具有明确连接点依据的管辖争议，归入地域管辖错误。
+    territorial_keywords = [
+        "地域管辖",
+        "被告住所地",
+        "原告住所地",
+        "申请人住所地",
+        "被申请人住所地",
+        "经常居住地",
+        "合同履行地",
+        "合同签订地",
+        "侵权行为地",
+        "侵权结果发生地",
+        "公司住所地",
+        "票据支付地",
+        "保险标的物所在地",
+        "运输始发地",
+        "运输目的地",
+        "财产所在地",
+        "约定管辖",
+        "协议管辖",
+    ]
+    territorial_patterns = [
+        r"(?:受诉|原审|该|本)法院.{0,20}(?:无权|不具有|没有)管辖权",
+        r"不属于.{0,30}人民法院管辖",
+        r"应由.{2,30}人民法院管辖",
+        r"移送(?:至|到)?.{2,30}人民法院(?:审理|管辖)",
+    ]
+    if any(keyword in normalized_text for keyword in territorial_keywords) or any(
+        re.search(pattern, normalized_text) for pattern in territorial_patterns
+    ):
+        return "地域管辖错误", "地域管辖异议"
+
+    return None, None
 
 
 def classify_guarantee_type(text: str) -> Optional[str]:
@@ -1519,7 +1603,9 @@ def extract_jurisdiction_objection(builder: ExtractionBuilder) -> None:
         r"移送\s*([\u4e00-\u9fff]{2,30}(?:高级|中级)?人民法院)\s*审理",
         r"移送至\s*([\u4e00-\u9fff]{2,30}(?:高级|中级)?人民法院)",
     ], request_text or text)
-    error_type, objection_type = classify_jurisdiction(text)
+    facts = extract_section(text, ["事实与理由", "事实和理由"], [])
+    jurisdiction_basis_text = "\n".join(part for part in [request_text, facts] if part) or text
+    error_type, objection_type = classify_jurisdiction(jurisdiction_basis_text)
     current_court = choose_court(text, "jurisdiction_objection")
 
     if applicant:
@@ -1532,11 +1618,16 @@ def extract_jurisdiction_objection(builder: ExtractionBuilder) -> None:
         builder.add("requested_transfer_court", requested_court, confidence=0.96, level="direct")
     if request_text:
         builder.add("objection_request", request_text, confidence=0.95, level="direct", value_type="text")
-    facts = extract_section(text, ["事实与理由", "事实和理由"], [])
     if facts:
         builder.add("objection_facts", facts, confidence=0.94, level="direct", value_type="text")
     if error_type:
-        builder.add("jurisdiction_error_type", error_type, confidence=0.76, level="conditional", note="根据住所地、合同履行地或专属管辖理由归类。")
+        builder.add(
+            "jurisdiction_error_type",
+            error_type,
+            confidence=0.82,
+            level="conditional",
+            note="仅在地域管辖错误、级别管辖错误、专属管辖错误三个固定枚举中归类。",
+        )
     if objection_type:
         builder.add("objection_type", objection_type, confidence=0.76, level="conditional")
     extract_common_date(builder, "application_date", level="direct", confidence=0.92)
