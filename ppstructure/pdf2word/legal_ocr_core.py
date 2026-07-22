@@ -1633,32 +1633,6 @@ def extract_jurisdiction_objection(builder: ExtractionBuilder) -> None:
     extract_common_date(builder, "application_date", level="direct", confidence=0.92)
 
 
-def extract_preservation_receiving_court(text: str) -> Optional[str]:
-    """从财产保全样本开头的“法院：具体法院”元数据中提取受理法院。"""
-    compact = compact_text(text)
-    header = compact[:500]
-
-    court_suffix = (
-        r"(?:人民法院|海事法院|知识产权法院|"
-        r"互联网法院|金融法院|铁路运输法院)"
-    )
-
-    return first_match(
-        [
-            # 标准样本：法院：杭州市余杭区人民法院
-            rf"法院[:：|丨｜]?([\u4e00-\u9fff]{{2,40}}?{court_suffix})"
-            rf"(?=版式|[｜|】\]]|$)",
-
-            # OCR 未识别“版式”前的分隔符
-            rf"法院[:：|丨｜]?([\u4e00-\u9fff]{{2,40}}?{court_suffix})",
-
-            # 极端情况下，“法院”标签被漏识别，但开头仍存在完整法院名称
-            rf"([\u4e00-\u9fff]{{2,40}}?{court_suffix})",
-        ],
-        header,
-    )
-
-
 def extract_preservation_application(builder: ExtractionBuilder) -> None:
     text = builder.source.text
     parties = builder.fields.get("parties")
@@ -1676,18 +1650,6 @@ def extract_preservation_application(builder: ExtractionBuilder) -> None:
     guarantee = extract_section(text, ["担保方式"], [])
     guarantee_type = classify_guarantee_type(guarantee or text)
     amount = request_amount_summary(target)
-    receiving_court = extract_preservation_receiving_court(text)
-
-    # 覆盖 common() 中通用法院识别可能从“恳请人民法院/请求人民法院”
-    # 误抽出的结果；这里只采用甲方样本首行元数据中的明确法院。
-    if receiving_court:
-        builder.add(
-            "court",
-            receiving_court,
-            confidence=0.99,
-            level="direct",
-            note="从文书首行【案由｜法院｜版式】元数据中的‘法院’字段提取。",
-        )
 
     if applicant:
         builder.add("applicant", applicant, confidence=0.9, level="conditional" if "脱敏" in applicant else "direct")
