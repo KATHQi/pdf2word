@@ -1634,21 +1634,28 @@ def extract_jurisdiction_objection(builder: ExtractionBuilder) -> None:
 
 
 def extract_preservation_receiving_court(text: str) -> Optional[str]:
-    """提取财产保全样本首行元数据中的受理法院。
-
-    甲方提供的样本统一采用：
-    ``文书X【案由：...｜法院：具体法院｜版式：...】``。
-    正文中的“恳请人民法院”“请求人民法院”以及末尾“此致 人民法院”
-    均不是具体法院名称，不能据此填写“受理法院”。
-    """
+    """从财产保全样本开头的“法院：具体法院”元数据中提取受理法院。"""
     compact = compact_text(text)
+    header = compact[:500]
+
+    court_suffix = (
+        r"(?:人民法院|海事法院|知识产权法院|"
+        r"互联网法院|金融法院|铁路运输法院)"
+    )
+
     return first_match(
         [
-            r"[【\[][^】\]]{0,240}?法院[:：]("
-            r"[\u4e00-\u9fff]{2,40}?(?:人民法院|海事法院|知识产权法院|互联网法院|金融法院|铁路运输法院)"
-            r")(?=[｜|】\]])",
+            # 标准样本：法院：杭州市余杭区人民法院
+            rf"法院[:：|丨｜]?([\u4e00-\u9fff]{{2,40}}?{court_suffix})"
+            rf"(?=版式|[｜|】\]]|$)",
+
+            # OCR 未识别“版式”前的分隔符
+            rf"法院[:：|丨｜]?([\u4e00-\u9fff]{{2,40}}?{court_suffix})",
+
+            # 极端情况下，“法院”标签被漏识别，但开头仍存在完整法院名称
+            rf"([\u4e00-\u9fff]{{2,40}}?{court_suffix})",
         ],
-        compact,
+        header,
     )
 
 
