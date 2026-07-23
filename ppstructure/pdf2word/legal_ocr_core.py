@@ -127,11 +127,17 @@ DOC_TYPES: Dict[str, Dict[str, str]] = {
     "unknown": {"name": "未识别文书", "page_code": "010", "page_name": "原始附件"},
 }
 
-STAGE_NAMES = {
+# 前端审级字段只允许以下四种稳定取值。
+# ``unknown`` 仅作为内部兜底状态，不应回填到前端“阶段”字段。
+TRIAL_STAGE_NAMES = {
     "first_instance": "一审",
     "second_instance": "二审",
-    "enforcement": "执行",
-    "pre_filing": "立案前/申请阶段",
+    "retrial_first_instance": "再一审",
+    "retrial_second_instance": "再二审",
+}
+
+STAGE_NAMES = {
+    **TRIAL_STAGE_NAMES,
     "unknown": "未知",
 }
 
@@ -745,7 +751,8 @@ def request_amount_summary(request_text: Optional[str]) -> Optional[Dict[str, An
 def extract_case_numbers(text: str) -> List[str]:
     text = normalize_text(text)
     patterns = [
-        r"[（(]\s*\d{4}\s*[）)]\s*[\u4e00-\u9fffA-Za-z0-9\s]{1,28}?\s*(?:民初|民终|民再|民申|民辖终|执|执恢|执异|刑初|刑终|行初|行终)\s*\d+\s*号",
+        # Longer tokens must appear first so OCR text such as“民再初/民再终”不会被短 token 截断。
+        r"[（(]\s*\d{4}\s*[）)]\s*[\u4e00-\u9fffA-Za-z0-9\s]{1,28}?\s*(?:民再初|民再终|民辖终|民初|民终|民再|民申|民监|民抗|执恢|执异|执|刑初|刑终|行初|行终)\s*\d+\s*号",
         r"[（(]\s*\d{4}\s*[）)]\s*[\u4e00-\u9fffA-Za-z0-9\s]{1,40}?\s*\d+\s*号",
     ]
     result: List[str] = []
@@ -761,22 +768,131 @@ def extract_case_numbers(text: str) -> List[str]:
     return result
 
 
-def infer_stage(text: str, case_numbers: Optional[List[str]] = None) -> Tuple[str, List[str]]:
+def select_primary_case_number(
+    text: str,
+    case_numbers: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """选择当前文书的主案号，而不是正文中引用的历史案号。
+
+    法院裁判文书通常在标题之后先列当前案号；正文后续才会引用原审、刑事
+    或关联案件案号。因此按文档出现顺序取第一个案号，和 ``common()`` 中
+    “案件编号”的取值规则保持一致。最重要的是：后文引用的“民终”案号
+    不得覆盖首页主案号中的“民初”。
+    """
+    numbers = list(case_numbers) if case_numbers is not None else extract_case_numbers(text)
+    return numbers[0] if numbers else None
+
+
+def _compact_case_number(case_number: Optional[str]) -> str:
+    return re.sub(r"\s+", "", normalize_text(case_number or ""))
+
+
+def _infer_retrial_stage(text: str, case_numbers: Sequence[str]) -> Tuple[str, str]:
+    """将“民再”细分为再一审或再二审。
+
+    “民再”代字只能证明案件属于民事再审，不能单独说明其适用一审还是
+    二审程序。因此在主案号确定为“民再”后，再读取程序性表述和原生效
+    裁判线索；此处的正文线索只用于细分再审，不得反向覆盖“民初/民终”。
+    """
+    normalized = normalize_text(text)
+    compact = compact_text(normalized)
+
+    first_procedure_patterns = [
+        r"(?:按照|依照|适用)第一审程序",
+        r"按第一审程序(?:审理|再审)",
+        r"原来(?:系|是|属于)第一审",
+        r"原生效(?:判决|裁定).{0,30}(?:民初|第一审)",
+    ]
+    second_procedure_patterns = [
+        r"(?:按照|依照|适用)第二审程序",
+        r"按第二审程序(?:审理|再审)",
+        r"原来(?:系|是|属于)第二审",
+        r"原生效(?:判决|裁定).{0,30}(?:民终|第二审)",
+        r"(?:本院|上级人民法院).{0,20}提审",
+        r"提审本案",
+    ]
+
+    if any(re.search(pattern, compact) for pattern in second_procedure_patterns):
+        return "retrial_second_instance", "主案号含“民再”，且正文明确适用第二审程序或属于提审"
+    if any(re.search(pattern, compact) for pattern in first_procedure_patterns):
+        return "retrial_first_instance", "主案号含“民再”，且正文明确适用第一审程序"
+
+    # 再审裁判常在开头交代原生效裁判。仅在主案号已确定为“民再”时，
+    # 才允许参考后续案号；若存在“民终”，原生效裁判通常属于二审。
+    referenced = [_compact_case_number(number) for number in case_numbers[1:]]
+    if any("民终" in number or "民辖终" in number for number in referenced):
+        return "retrial_second_instance", "主案号含“民再”，且后续原审裁判链包含“民终”案号"
+    if any("民初" in number for number in referenced):
+        return "retrial_first_instance", "主案号含“民再”，且后续原审裁判链仅识别到“民初”案号"
+
+    # 前端只接受四种审级。民再案号无法进一步细分且没有程序线索时，
+    # 采用“再一审”作为保守默认，并在 reasons 中明确标记，便于人工复核。
+    return "retrial_first_instance", "主案号仅能确定为“民再”；未发现二审程序或提审线索，默认按“再一审”返回"
+
+
+def infer_stage(
+    text: str,
+    case_numbers: Optional[List[str]] = None,
+    document_type: Optional[str] = None,
+) -> Tuple[str, List[str]]:
+    """推断审级，主案号具有最高且排他的优先级。
+
+    判定顺序：
+    1. 当前文书第一个案号（主案号）；
+    2. 仅当主案号无法判断时，使用标题附近的程序角色/程序名称；
+    3. 对无案号的起诉状、上诉状等申请类文书，默认返回一审。
+
+    这样可以避免一审判决书因正文引用历史二审案号、出现“上诉人”或
+    “二审判决”等词而被错误识别为二审。
+    """
     reasons: List[str] = []
-    numbers = case_numbers or extract_case_numbers(text)
-    joined = " ".join(numbers)
-    if re.search(r"(?:执|执恢|执异)\s*\d+\s*号", joined) or "强制执行申请书" in text:
-        reasons.append("执行案号或执行申请书标题")
-        return "enforcement", reasons
-    if "民终" in joined or "二审" in text or "上诉人" in text or "被上诉人" in text:
-        reasons.append("案号含“民终”或正文出现二审角色")
-        return "second_instance", reasons
-    if "民初" in joined:
-        reasons.append("案号含“民初”")
+    normalized = normalize_text(text)
+    numbers = case_numbers if case_numbers is not None else extract_case_numbers(normalized)
+    primary = select_primary_case_number(normalized, numbers)
+    primary_compact = _compact_case_number(primary)
+
+    if primary:
+        if re.search(r"(?:执恢|执异|执)\d+号", primary_compact):
+            reasons.append(f"主案号“{primary}”属于执行案号，不回填民事审级")
+            return "unknown", reasons
+        if "民再初" in primary_compact:
+            reasons.append(f"主案号“{primary}”含“民再初”")
+            return "retrial_first_instance", reasons
+        if "民再终" in primary_compact:
+            reasons.append(f"主案号“{primary}”含“民再终”")
+            return "retrial_second_instance", reasons
+        if "民初" in primary_compact:
+            reasons.append(f"主案号“{primary}”含“民初”")
+            return "first_instance", reasons
+        if "民终" in primary_compact or "民辖终" in primary_compact:
+            reasons.append(f"主案号“{primary}”含“民终/民辖终”")
+            return "second_instance", reasons
+        if "民再" in primary_compact:
+            stage, reason = _infer_retrial_stage(normalized, numbers)
+            reasons.append(reason)
+            return stage, reasons
+        if any(token in primary_compact for token in ["民申", "民监", "民抗"]):
+            reasons.append(f"主案号“{primary}”属于再审审查/监督程序，不直接等同于再审审理审级")
+            return "unknown", reasons
+
+    # 主案号不存在或不含稳定审级代字时，只观察标题附近，避免正文中的
+    # 历史案件描述污染结果。
+    header = normalized[: min(len(normalized), 1800)]
+    if document_type in {"civil_complaint", "jurisdiction_objection", "preservation_application", "defense", "appeal"}:
+        reasons.append("未识别到可判定审级的主案号；申请/诉状类文书默认按一审返回")
         return "first_instance", reasons
-    if any(title in text for title in ["民事起诉状", "管辖权异议申请书", "财产保全申请书", "民事上诉状"]):
-        reasons.append("申请类文书尚未稳定进入法院审级")
-        return "pre_filing", reasons
+    if "再审" in header:
+        if re.search(r"(?:按照|依照|适用)第二审程序|提审", compact_text(header)):
+            reasons.append("标题附近出现再审及第二审程序/提审表述")
+            return "retrial_second_instance", reasons
+        reasons.append("标题附近出现再审表述，未发现二审程序线索，默认按再一审返回")
+        return "retrial_first_instance", reasons
+    if "二审" in header or "上诉人" in header or "被上诉人" in header:
+        reasons.append("主案号无法判断，标题附近出现二审程序角色")
+        return "second_instance", reasons
+    if document_type in {"summons", "evidence_notice", "judgment", "procedural_ruling"}:
+        reasons.append("主案号无法判断，法院民事文书默认按一审返回")
+        return "first_instance", reasons
     return "unknown", reasons
 
 
@@ -1301,7 +1417,7 @@ def classify_document(text: str, filename: str = "", hint: Optional[str] = None)
         final_reasons = reasons[best_type]
 
     case_numbers = extract_case_numbers(normalized)
-    stage, stage_reasons = infer_stage(normalized, case_numbers)
+    stage, stage_reasons = infer_stage(normalized, case_numbers, document_type=best_type)
     final_reasons = unique_preserve_order(final_reasons + stage_reasons)
 
     profile = DOC_TYPES[best_type]
@@ -1379,21 +1495,22 @@ class ExtractionBuilder:
         if court:
             self.add("court", court, confidence=0.95, level="direct")
         self.add("case_type", "民事", confidence=0.78, level="conditional", note="由文书标题、案号及案由推断。")
-        if case_numbers:
-            # Use the first number as the current document number. Type-specific extractors may override.
-            self.add("case_no", case_numbers[0], confidence=0.96, level="direct")
+        primary_case_number = select_primary_case_number(text, case_numbers)
+        if primary_case_number:
+            # “案件编号”和审级必须使用同一个主案号，禁止被正文引用案号覆盖。
+            self.add("case_no", primary_case_number, confidence=0.96, level="direct")
         if cause:
             self.add("cause", cause, confidence=0.94, level="direct")
         if contracts:
             self.add("contract_no", contracts, confidence=0.88, level="conditional", value_type="array")
-        if self.classification.stage != "unknown":
+        if self.classification.stage in TRIAL_STAGE_NAMES:
             self.add(
                 "stage",
                 self.classification.stage_name,
                 normalized=self.classification.stage,
                 confidence=self.classification.confidence,
                 level="conditional",
-                note="审级优先由法院案号判断，其次才使用标题和文件名。",
+                note="审级以当前文书主案号为最高优先级；正文引用的历史案号不得覆盖主案号。",
             )
         if parties:
             self.add("parties", parties, confidence=0.89, level="direct", value_type="array")
@@ -1956,6 +2073,10 @@ def extract_legal_document(
 
 def api_schema() -> Dict[str, Any]:
     return {
+        "trial_stages": [
+            {"code": code, "name": name}
+            for code, name in TRIAL_STAGE_NAMES.items()
+        ],
         "document_types": {
             key: {
                 **value,
