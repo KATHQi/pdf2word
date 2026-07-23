@@ -238,14 +238,14 @@ FRONTEND_FIELD_MAP: Dict[str, Dict[str, str]] = {
         "case_type": "案件类型",
         "cause": "案由",
         "contract_no": "涉案合同编号",
-        "court": "一审受理法院",
+        "court": "受理法院",
         "claim_amount": "诉讼标的额",
-        "litigation_fee": "一审诉讼费",
+        "litigation_fee": "诉讼费",
         "requests": "原告诉讼请求",
         "parties": "人员信息：原告/被告名称",
         "relative_appeal_deadline": "上诉截止日期",
-        "relative_fulfillment_deadline": "一审判决执行截止日期",
-        "judgment_result": "一审判决结果",
+        "relative_fulfillment_deadline": "判决执行截止日期",
+        "judgment_result": "判决结果",
         "request_support": "支持诉讼请求",
         "case_analysis": "案件分析/案例分析",
     },
@@ -314,11 +314,11 @@ BLOCKED_FIELDS: Dict[str, List[Tuple[str, str]]] = {
         ("案件归属业务部门", "企业内部管理字段，OCR不得覆盖。"),
     ],
     "judgment": [
-        ("一审判决签收日期", "判决落款日期不等于当事人签收日期。"),
-        ("一审判决生效日期", "需结合送达和上诉情况，不能由落款日期推断。"),
+        ("判决签收日期", "判决落款日期不等于当事人签收日期。"),
+        ("判决生效日期", "需结合送达和上诉情况，不能由落款日期推断。"),
         ("诉讼费缴纳人", "费用最终负担人不等于实际缴费人。"),
         ("诉讼费缴纳单号", "应来自票据。"),
-        ("一审判决执行状态", "属于后续执行流程字段。"),
+        ("判决执行状态", "属于后续执行流程字段。"),
         ("案件归属业务部门", "企业内部管理字段，OCR不得覆盖。"),
     ],
     "enforcement_application": [
@@ -330,7 +330,7 @@ BLOCKED_FIELDS: Dict[str, List[Tuple[str, str]]] = {
         ("执行和解状态", "属于后续执行流程。"),
     ],
     "procedural_ruling": [
-        ("一审判决结果", "程序性裁定不得写入实体判决结果。"),
+        ("判决结果", "程序性裁定不得写入实体判决结果。"),
         ("支持诉讼请求", "程序性裁定不评价实体诉讼请求。"),
     ],
 }
@@ -1880,18 +1880,28 @@ def extract_appeal(builder: ExtractionBuilder) -> None:
 
 
 def extract_litigation_fees(text: str) -> Optional[List[Dict[str, Any]]]:
-    result: List[Dict[str, Any]] = []
+    """提取判决书正文中最先出现的一项诉讼费用。
+
+    判决书可能同时列出案件受理费、保全费、上诉费等多个结果。根据业务
+    规则，无论当前案件属于一审、二审、再一审还是再二审，均只保留原文
+    顺序中的第一个匹配结果。
+    """
     fee_types = ["案件受理费", "受理费", "保全费", "上诉费", "执行费"]
-    for fee_type in fee_types:
-        pattern = rf"{fee_type}\s*([0-9,，.]+)\s*元"
-        for m in re.finditer(pattern, text):
-            result.append({
-                "type": fee_type,
-                "amount": float(m.group(1).replace(",", "").replace("，", "")),
-                "currency": "CNY",
-                "raw": m.group(0),
-            })
-    return unique_preserve_order(result) or None
+    fee_type_pattern = "|".join(
+        re.escape(fee_type) for fee_type in sorted(fee_types, key=len, reverse=True)
+    )
+    pattern = re.compile(
+        rf"(?P<type>{fee_type_pattern})\s*(?P<amount>[0-9,，.]+)\s*元"
+    )
+    match = pattern.search(text)
+    if not match:
+        return None
+    return [{
+        "type": match.group("type"),
+        "amount": float(match.group("amount").replace(",", "").replace("，", "")),
+        "currency": "CNY",
+        "raw": match.group(0),
+    }]
 
 
 def compare_request_support(requests: Optional[str], judgment: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1927,6 +1937,18 @@ def extract_judgment(builder: ExtractionBuilder) -> None:
     judgment = extract_section(text, ["判决如下"], [])
     fees = extract_litigation_fees(text)
     amount = request_amount_summary(requests)
+    if amount and amount.get("amounts"):
+        # 《民事判决书》的诉讼标的额若匹配到多个金额，只保留原文中第一个。
+        # 该规则仅在判决书提取流程中生效，不改变起诉状、上诉状等文书的
+        # request_amount_summary 聚合行为。
+        first_amount = amount["amounts"][0]
+        amount = {
+            "amounts": [first_amount],
+            "sum": first_amount["amount"],
+            "currency": first_amount.get("currency", "CNY"),
+            "requires_review": amount.get("requires_review", False),
+            "selection_rule": "first_occurrence",
+        }
     support = compare_request_support(requests, judgment)
     date_info = extract_issue_or_signature_date(text)
     appeal_deadline = parse_relative_deadline(first_match([r"(如不服本判决.*?上诉。?)"], text, flags=re.S) or "")
